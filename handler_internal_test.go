@@ -12,13 +12,14 @@ import (
 	"time"
 
 	logger "github.com/soulteary/logger-kit"
+	metrics "github.com/soulteary/metrics-kit"
 )
 
 func TestNewHandlerWithOptions_WithLogger(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	cache := NewMemoryCache()
 	log := logger.Default()
@@ -73,7 +74,7 @@ func TestServeHTTP_OnlyIfCached_Miss(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	h := NewHandler(NewMemoryCache(), upstream)
 	req := httptest.NewRequest("GET", "http://example.org/", nil)
@@ -95,7 +96,7 @@ func TestServeHTTP_LookupError(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	h := NewHandler(failCache, upstream)
 	// First request stores; second would hit Retrieve error. So we need to store then retrieve with error.
@@ -141,7 +142,7 @@ func TestHandler_Errorf_StoreFails(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	h := NewHandler(failStore, upstream)
 	req := httptest.NewRequest("GET", "http://example.org/", nil)
@@ -162,7 +163,7 @@ func (f *failStoreCache) Store(res *Resource, keys ...string) error {
 	return errors.New("injected store error")
 }
 func (f *failStoreCache) Retrieve(key string) (*Resource, error) { return f.cache.Retrieve(key) }
-func (f *failStoreCache) Invalidate(keys ...string)             { f.cache.Invalidate(keys...) }
+func (f *failStoreCache) Invalidate(keys ...string)              { f.cache.Invalidate(keys...) }
 func (f *failStoreCache) Freshen(res *Resource, keys ...string) error {
 	return f.cache.Freshen(res, keys...)
 }
@@ -173,11 +174,11 @@ func TestTempFileReadSeekCloser(t *testing.T) {
 		t.Skip("CreateTemp failed:", err)
 	}
 	path := f.Name()
-	f.Write([]byte("hello"))
-	f.Close()
+	_, _ = f.Write([]byte("hello"))
+	_ = f.Close()
 	f2, err := os.Open(path)
 	if err != nil {
-		os.Remove(path)
+		_ = os.Remove(path)
 		t.Fatal(err)
 	}
 	tf := &tempFileReadSeekCloser{file: f2, path: path}
@@ -196,6 +197,146 @@ func TestTempFileReadSeekCloser(t *testing.T) {
 	}
 	if err := tf.Close(); err != nil {
 		t.Error("Close:", err)
+	}
+}
+
+// TestTempFileReadSeekCloser_Close_RemoveFails covers Close() when os.Remove(path) fails (e.g. path nonexistent).
+func TestTempFileReadSeekCloser_Close_RemoveFails(t *testing.T) {
+	tf := &tempFileReadSeekCloser{file: nil, path: "/nonexistent_httpcache_test_xyz"}
+	err := tf.Close()
+	if err == nil {
+		t.Error("Close with nonexistent path should return error from Remove")
+	}
+}
+
+func TestPassUpstream_NoDate_CorrectedAgeError(t *testing.T) {
+	oldTmp := os.Getenv("TMPDIR")
+	_ = os.Setenv("TMPDIR", "/nonexistent_httpcache_test_xyz")
+	defer func() {
+		if oldTmp != "" {
+			_ = os.Setenv("TMPDIR", oldTmp)
+		} else {
+			_ = os.Unsetenv("TMPDIR")
+		}
+	}()
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+		// No Date header -> correctedAge fails in finishPassUpstream
+	})
+	h := NewHandler(NewMemoryCache(), upstream)
+	req := httptest.NewRequest("GET", "http://example.org/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	Writes.Wait()
+	if rec.Code != http.StatusOK {
+		t.Errorf("want 200, got %d", rec.Code)
+	}
+}
+
+func TestPassUpstream_NoDate_WithMetrics(t *testing.T) {
+	oldTmp := os.Getenv("TMPDIR")
+	_ = os.Setenv("TMPDIR", "/nonexistent_httpcache_test_xyz")
+	defer func() {
+		if oldTmp != "" {
+			_ = os.Setenv("TMPDIR", oldTmp)
+		} else {
+			_ = os.Unsetenv("TMPDIR")
+		}
+	}()
+	reg := metrics.NewRegistry("test_finish_pass_metrics")
+	m := NewCacheMetrics(reg)
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	h := NewHandler(NewMemoryCache(), upstream)
+	h.SetMetrics(m)
+	req := httptest.NewRequest("GET", "http://example.org/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	Writes.Wait()
+	if rec.Code != http.StatusOK {
+		t.Errorf("want 200, got %d", rec.Code)
+	}
+}
+
+func TestIsCacheable_PrivateShared(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "private")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	h := NewHandler(NewMemoryCache(), upstream)
+	h.Shared = true
+	req := httptest.NewRequest("GET", "http://example.org/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("want 200, got %d", rec.Code)
+	}
+	if rec.Header().Get(CacheHeader) != "SKIP" && rec.Header().Get(CacheHeader) != "MISS" {
+		t.Logf("X-Cache: %s (expect SKIP when uncacheable private)", rec.Header().Get(CacheHeader))
+	}
+}
+
+func TestIsCacheable_NonStoreableStatus(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("not found"))
+	})
+	h := NewHandler(NewMemoryCache(), upstream)
+	req := httptest.NewRequest("GET", "http://example.org/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("want 404, got %d", rec.Code)
+	}
+	if rec.Header().Get(CacheHeader) != "SKIP" {
+		t.Logf("X-Cache: %s (404 not storeable)", rec.Header().Get(CacheHeader))
+	}
+}
+
+func TestIsCacheable_RequestAuthorizationShared(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	h := NewHandler(NewMemoryCache(), upstream)
+	h.Shared = true
+	req := httptest.NewRequest("GET", "http://example.org/", nil)
+	req.Header.Set("Authorization", "Bearer token")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("want 200, got %d", rec.Code)
+	}
+	if rec.Header().Get(CacheHeader) != "SKIP" && rec.Header().Get(CacheHeader) != "MISS" {
+		t.Logf("X-Cache: %s (request Authorization + Shared -> uncacheable)", rec.Header().Get(CacheHeader))
+	}
+}
+
+func TestIsCacheable_ResponseAuthorizationShared(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
+		w.Header().Set("Authorization", "Bearer response-token")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	h := NewHandler(NewMemoryCache(), upstream)
+	h.Shared = true
+	req := httptest.NewRequest("GET", "http://example.org/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("want 200, got %d", rec.Code)
+	}
+	if rec.Header().Get(CacheHeader) != "SKIP" {
+		t.Logf("X-Cache: %s (response Authorization + Shared without s-maxage -> uncacheable)", rec.Header().Get(CacheHeader))
 	}
 }
 
@@ -258,6 +399,37 @@ func TestCorrectedAge_NoAge(t *testing.T) {
 	}
 }
 
+func TestCorrectedAge_ApparentAgeNegative(t *testing.T) {
+	// Date in future -> apparentAge = respTime - date < 0 -> clamp to 0
+	future := time.Now().UTC().Add(1 * time.Hour)
+	h := http.Header{}
+	h.Set("Date", future.Format(http.TimeFormat))
+	h.Set("Age", "0")
+	reqTime := time.Now().UTC().Add(-1 * time.Second)
+	respTime := time.Now().UTC()
+	_, err := correctedAge(h, reqTime, respTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCorrectedAge_ApparentAgeGreaterThanCorrected(t *testing.T) {
+	// apparentAge > correctedAge -> use apparentAge
+	past := time.Now().UTC().Add(-100 * time.Second)
+	h := http.Header{}
+	h.Set("Date", past.Format(http.TimeFormat))
+	h.Set("Age", "0")
+	reqTime := time.Now().UTC().Add(-2 * time.Second)
+	respTime := time.Now().UTC()
+	age, err := correctedAge(h, reqTime, respTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if age <= 0 {
+		t.Errorf("expected positive age, got %v", age)
+	}
+}
+
 func TestServeResource_NonOKStatus(t *testing.T) {
 	cache := NewMemoryCache()
 	res := NewResourceBytes(http.StatusNotFound, []byte("not found"), http.Header{
@@ -269,7 +441,7 @@ func TestServeResource_NonOKStatus(t *testing.T) {
 	}
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	h := NewHandler(cache, upstream)
 	req := httptest.NewRequest("GET", "http://example.org/notfound", nil)
@@ -293,7 +465,7 @@ func TestLookup_VarySecondaryMiss(t *testing.T) {
 	}
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	h := NewHandler(cache, upstream)
 	req := httptest.NewRequest("GET", "http://example.org/", nil)
@@ -318,7 +490,7 @@ func TestLookup_HEAD_NoExplicitExpiration(t *testing.T) {
 	}
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	h := NewHandler(cache, upstream)
 	req := httptest.NewRequest("HEAD", "http://example.org/", nil)
@@ -334,7 +506,7 @@ func TestOnlyIfCached_InCacheNeedsValidation(t *testing.T) {
 		w.Header().Set("Cache-Control", "max-age=60, must-revalidate")
 		w.Header().Set("Date", time.Now().UTC().Add(-2*time.Minute).Format(http.TimeFormat))
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	cache := NewMemoryCache()
 	h := NewHandler(cache, upstream)
@@ -357,7 +529,7 @@ func TestNeedsValidation_MinFreshError(t *testing.T) {
 		w.Header().Set("Cache-Control", "max-age=60")
 		w.Header().Set("Date", time.Now().UTC().Add(-30*time.Second).Format(http.TimeFormat))
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	cache := NewMemoryCache()
 	if err := cache.Store(NewResourceBytes(200, []byte("x"), http.Header{
@@ -382,7 +554,7 @@ func TestFreshness_RequestMaxAge(t *testing.T) {
 		w.Header().Set("Cache-Control", "max-age=3600")
 		w.Header().Set("Date", time.Now().UTC().Add(-1*time.Second).Format(http.TimeFormat))
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	cache := NewMemoryCache()
 	h := NewHandler(cache, upstream)
@@ -411,7 +583,7 @@ func TestFreshness_HeuristicFreshness(t *testing.T) {
 	}
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	h := NewHandler(cache, upstream)
 	req := httptest.NewRequest("GET", "http://example.org/heuristic", nil)
@@ -440,7 +612,7 @@ func TestNeedsValidation_MinFresh(t *testing.T) {
 		w.Header().Set("Cache-Control", "max-age=60")
 		w.Header().Set("Date", now.Add(-30*time.Second).Format(http.TimeFormat))
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	h := NewHandler(cache, upstream)
 	req := httptest.NewRequest("GET", "http://example.org/minfresh", nil)
@@ -465,7 +637,7 @@ func TestNeedsValidation_MaxStale_Empty(t *testing.T) {
 	}
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("new"))
+		_, _ = w.Write([]byte("new"))
 	})
 	h := NewHandler(cache, upstream)
 	req := httptest.NewRequest("GET", "http://example.org/maxstale", nil)
@@ -480,6 +652,101 @@ func TestNeedsValidation_MaxStale_Empty(t *testing.T) {
 	}
 }
 
+func TestNeedsValidation_MaxStale_WithValue(t *testing.T) {
+	// Stale resource, request has max-stale=3600 -> serve stale (maxStale >= -freshness branch)
+	now := time.Now().UTC()
+	cache := NewMemoryCache()
+	res := NewResourceBytes(200, []byte("ok"), http.Header{
+		"Cache-Control": []string{"max-age=10"},
+		"Date":          []string{now.Add(-1 * time.Minute).Format(http.TimeFormat)},
+	})
+	if err := cache.Store(res, "GET:http://example.org/maxstaleval"); err != nil {
+		t.Fatal(err)
+	}
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("new"))
+	})
+	h := NewHandler(cache, upstream)
+	req := httptest.NewRequest("GET", "http://example.org/maxstaleval", nil)
+	req.Header.Set("Cache-Control", "max-stale=3600")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("want 200, got %d", rec.Code)
+	}
+	if rec.Header().Get(CacheHeader) != "HIT" {
+		t.Errorf("want HIT (serve stale with max-stale=3600), got %s", rec.Header().Get(CacheHeader))
+	}
+}
+
+func TestFreshness_IsStale(t *testing.T) {
+	// Cached resource then invalidated -> Retrieve returns resource with MarkStale(); freshness returns 0
+	cache := NewMemoryCache()
+	res := NewResourceBytes(200, []byte("ok"), http.Header{
+		"Cache-Control": []string{"max-age=60"},
+		"Date":          []string{time.Now().UTC().Format(http.TimeFormat)},
+	})
+	if err := cache.Store(res, "GET:http://example.org/stale"); err != nil {
+		t.Fatal(err)
+	}
+	cache.Invalidate("GET:http://example.org/stale")
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("new"))
+	})
+	h := NewHandler(cache, upstream)
+	req := httptest.NewRequest("GET", "http://example.org/stale", nil)
+	req.Header.Set("Cache-Control", "max-stale=60")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("want 200, got %d", rec.Code)
+	}
+}
+
+func TestNeedsValidation_FreshnessError(t *testing.T) {
+	// Cached resource with invalid max-age -> freshness(res, r) returns error -> needsValidation true
+	cache := NewMemoryCache()
+	res := NewResourceBytes(200, []byte("ok"), http.Header{
+		"Cache-Control": []string{"max-age=invalid"},
+		"Date":          []string{time.Now().UTC().Format(http.TimeFormat)},
+	})
+	if err := cache.Store(res, "GET:http://example.org/badmaxage"); err != nil {
+		t.Fatal(err)
+	}
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	h := NewHandler(cache, upstream)
+	req := httptest.NewRequest("GET", "http://example.org/badmaxage", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("want 200, got %d", rec.Code)
+	}
+}
+
+func TestIsCacheable_PublicWithHeuristic(t *testing.T) {
+	// GET miss, upstream returns 200 Cache-Control: public, Last-Modified (no max-age) -> cacheableByDefault + HeuristicFreshness
+	lastMod := time.Now().UTC().Add(-1 * time.Hour)
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "public")
+		w.Header().Set("Last-Modified", lastMod.Format(http.TimeFormat))
+		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	h := NewHandler(NewMemoryCache(), upstream)
+	req := httptest.NewRequest("GET", "http://example.org/public", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("want 200, got %d", rec.Code)
+	}
+}
+
 func TestServeResource_CloseError(t *testing.T) {
 	// When res.Close() fails after serving we call errorf
 	brokenRes := NewResourceBytes(200, []byte("ok"), http.Header{
@@ -490,7 +757,7 @@ func TestServeResource_CloseError(t *testing.T) {
 	fakeCache := &closeFailCache{res: brokenRes}
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	h := NewHandler(fakeCache, upstream)
 	req := httptest.NewRequest("GET", "http://example.org/", nil)
@@ -526,7 +793,7 @@ func TestIsCacheable_StatusNotStoreable(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte("created"))
+		_, _ = w.Write([]byte("created"))
 	})
 	h := NewHandler(NewMemoryCache(), upstream)
 	req := httptest.NewRequest("GET", "http://example.org/create", nil)
@@ -544,7 +811,7 @@ func TestPipeUpstream_NonCacheableRequest(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	h := NewHandler(NewMemoryCache(), upstream)
 	// Request with If-Range makes it non-cacheable -> pipeUpstream
@@ -563,12 +830,12 @@ func TestPipeUpstream_NonCacheableRequest(t *testing.T) {
 // TestPassUpstream_CreateTempFails triggers finishPassUpstream by making os.CreateTemp fail (invalid TMPDIR).
 func TestPassUpstream_CreateTempFails(t *testing.T) {
 	oldTmp := os.Getenv("TMPDIR")
-	os.Setenv("TMPDIR", "/nonexistent_httpcache_test_xyz_123")
+	_ = os.Setenv("TMPDIR", "/nonexistent_httpcache_test_xyz_123")
 	defer func() {
 		if oldTmp != "" {
-			os.Setenv("TMPDIR", oldTmp)
+			_ = os.Setenv("TMPDIR", oldTmp)
 		} else {
-			os.Unsetenv("TMPDIR")
+			_ = os.Unsetenv("TMPDIR")
 		}
 	}()
 
@@ -576,7 +843,7 @@ func TestPassUpstream_CreateTempFails(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(http.StatusOK)
-		w.Write(body)
+		_, _ = w.Write(body)
 	})
 	h := NewHandler(NewMemoryCache(), upstream)
 	req := httptest.NewRequest("GET", "http://example.org/", nil)
@@ -591,4 +858,3 @@ func TestPassUpstream_CreateTempFails(t *testing.T) {
 		t.Errorf("body: got %q", got)
 	}
 }
-

@@ -37,7 +37,7 @@ var cacheableByDefault = map[int]bool{
 	http.StatusFound:                true,
 	http.StatusNotModified:          true,
 	http.StatusNonAuthoritativeInfo: true,
-	http.StatusMultipleChoices:     true,
+	http.StatusMultipleChoices:      true,
 	http.StatusMovedPermanently:     true,
 	http.StatusGone:                 true,
 	http.StatusPartialContent:       true,

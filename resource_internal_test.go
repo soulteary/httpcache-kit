@@ -66,9 +66,9 @@ func TestResource_HasExplicitExpiration_NoHeaders(t *testing.T) {
 func TestResource_Age_WithProxyDate(t *testing.T) {
 	past := time.Now().UTC().Add(-time.Minute)
 	r := NewResourceBytes(200, []byte("x"), http.Header{
-		"Date":        []string{past.Format(http.TimeFormat)},
+		"Date":       []string{past.Format(http.TimeFormat)},
 		"Proxy-Date": []string{past.Format(http.TimeFormat)},
-		"Age":         []string{"30"},
+		"Age":        []string{"30"},
 	})
 	Clock = func() time.Time { return past.Add(2 * time.Minute) }
 	defer func() { Clock = func() time.Time { return time.Now().UTC() } }()
@@ -117,6 +117,77 @@ func TestResource_HasExplicitExpiration_SMaxage(t *testing.T) {
 	})
 	if !r.HasExplicitExpiration() {
 		t.Error("HasExplicitExpiration should be true with s-maxage")
+	}
+}
+
+func TestResource_MustValidate_SMaxageShared(t *testing.T) {
+	r := NewResourceBytes(200, []byte("x"), http.Header{
+		"Cache-Control": []string{"s-maxage=60"},
+	})
+	if !r.MustValidate(true) {
+		t.Error("MustValidate(shared) should be true with s-maxage")
+	}
+}
+
+func TestResource_MustValidate_MustRevalidate(t *testing.T) {
+	r := NewResourceBytes(200, []byte("x"), http.Header{
+		"Cache-Control": []string{"must-revalidate"},
+	})
+	if !r.MustValidate(false) {
+		t.Error("MustValidate should be true with must-revalidate")
+	}
+}
+
+func TestResource_MustValidate_NoRevalidate(t *testing.T) {
+	r := NewResourceBytes(200, []byte("x"), http.Header{
+		"Cache-Control": []string{"max-age=60"},
+	})
+	if r.MustValidate(false) {
+		t.Error("MustValidate(false) with only max-age (no must-revalidate) should be false")
+	}
+}
+
+func TestResource_MaxAge_SMaxageInvalid(t *testing.T) {
+	r := NewResourceBytes(200, []byte("x"), http.Header{
+		"Cache-Control": []string{"s-maxage=invalid"},
+	})
+	_, err := r.MaxAge(true)
+	if err == nil {
+		t.Error("MaxAge(true) with invalid s-maxage should error")
+	}
+}
+
+func TestResource_MaxAge_ExpiresInvalid(t *testing.T) {
+	r := NewResourceBytes(200, []byte("x"), http.Header{
+		"Expires": []string{"not-a-valid-date"},
+	})
+	_, err := r.MaxAge(false)
+	if err == nil {
+		t.Error("MaxAge with invalid Expires should error")
+	}
+}
+
+func TestResource_MaxAge_NoExpiration(t *testing.T) {
+	r := NewResourceBytes(200, []byte("x"), http.Header{
+		"Cache-Control": []string{"public"},
+	})
+	d, err := r.MaxAge(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != 0 {
+		t.Errorf("MaxAge with no max-age/s-maxage/Expires should be 0, got %v", d)
+	}
+}
+
+func TestResource_RemovePrivateHeaders_WithPrivate(t *testing.T) {
+	r := NewResourceBytes(200, []byte("x"), http.Header{
+		"Cache-Control": []string{"private=X-Custom"},
+		"X-Custom":      []string{"secret"},
+	})
+	r.RemovePrivateHeaders()
+	if r.Header().Get("X-Custom") != "" {
+		t.Error("RemovePrivateHeaders should remove headers listed in private directive")
 	}
 }
 
