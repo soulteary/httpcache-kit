@@ -394,6 +394,7 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest) {
 		h.metrics.RecordUpstreamDuration(r.Method, rw.StatusCode, upstreamDuration.Seconds())
 	}
 
+	proxyDate := Clock().Format(http.TimeFormat)
 	if age, err := correctedAge(res.Header(), t, Clock()); err == nil {
 		ageStr := strconv.Itoa(int(math.Ceil(age.Seconds())))
 		res.Header().Set("Age", ageStr)
@@ -402,7 +403,8 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest) {
 		h.debugf("error calculating corrected age: %s", err.Error())
 	}
 
-	rw.Header().Set(ProxyDateHeader, Clock().Format(http.TimeFormat))
+	rw.Header().Set(ProxyDateHeader, proxyDate)
+	res.Header().Set(ProxyDateHeader, proxyDate) // so cached Resource.Age() uses receive time, not upstream Date
 
 	// Store resource in background - errors won't affect client response
 	h.storeResource(res, r)
@@ -418,6 +420,7 @@ func (h *Handler) finishPassUpstream(res *Resource, r *cacheRequest, rw *respons
 		h.metrics.RecordUpstreamDuration(r.Method, rw.StatusCode, upstreamDuration.Seconds())
 	}
 
+	proxyDate := Clock().Format(http.TimeFormat)
 	if age, err := correctedAge(res.Header(), t, Clock()); err == nil {
 		ageStr := strconv.Itoa(int(math.Ceil(age.Seconds())))
 		res.Header().Set("Age", ageStr)
@@ -426,7 +429,8 @@ func (h *Handler) finishPassUpstream(res *Resource, r *cacheRequest, rw *respons
 		h.debugf("error calculating corrected age: %s", err.Error())
 	}
 
-	rw.Header().Set(ProxyDateHeader, Clock().Format(http.TimeFormat))
+	rw.Header().Set(ProxyDateHeader, proxyDate)
+	res.Header().Set(ProxyDateHeader, proxyDate) // so cached Resource.Age() uses receive time, not upstream Date
 	h.storeResource(res, r)
 }
 
