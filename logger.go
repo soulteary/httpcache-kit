@@ -1,11 +1,19 @@
 package httpcache
 
 import (
+	"sync/atomic"
+
 	logger "github.com/soulteary/logger-kit"
 )
 
-// DebugLogging controls whether debug messages are logged
-var DebugLogging = false
+// debugLogging is the atomic flag for whether debug messages are logged.
+var debugLogging atomic.Bool
+
+// SetDebugLogging sets whether debug messages are logged. Safe for concurrent use.
+func SetDebugLogging(b bool) { debugLogging.Store(b) }
+
+// IsDebugLogging returns whether debug messages are logged. Safe for concurrent use.
+func IsDebugLogging() bool { return debugLogging.Load() }
 
 // cacheLogger is the logger instance used by httpcache package
 var cacheLogger = logger.Default()
@@ -19,7 +27,7 @@ func SetLogger(log *logger.Logger) {
 }
 
 func debugf(format string, args ...interface{}) {
-	if DebugLogging {
+	if IsDebugLogging() {
 		cacheLogger.Debug().Msgf(format, args...)
 	}
 }

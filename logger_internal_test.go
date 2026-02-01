@@ -10,9 +10,9 @@ func TestPackageErrorf(t *testing.T) {
 }
 
 func TestPackageDebugf(t *testing.T) {
-	// Package-level debugf only logs when DebugLogging is true
-	prev := DebugLogging
-	DebugLogging = true
-	defer func() { DebugLogging = prev }()
+	// Package-level debugf only logs when IsDebugLogging is true
+	prev := IsDebugLogging()
+	SetDebugLogging(true)
+	defer func() { SetDebugLogging(prev) }()
 	debugf("test debug %s", "value")
 }

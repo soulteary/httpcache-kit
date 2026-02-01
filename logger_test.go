@@ -17,11 +17,11 @@ func TestSetLogger(t *testing.T) {
 	httpcache.SetLogger(l)
 }
 
-// TestDebugLogging triggers package-level debugf by enabling DebugLogging and making a request.
+// TestDebugLogging triggers package-level debugf by enabling debug logging and making a request.
 func TestDebugLogging(t *testing.T) {
-	prev := httpcache.DebugLogging
-	httpcache.DebugLogging = true
-	defer func() { httpcache.DebugLogging = prev }()
+	prev := httpcache.IsDebugLogging()
+	httpcache.SetDebugLogging(true)
+	defer func() { httpcache.SetDebugLogging(prev) }()
 	log.SetOutput(io.Discard)
 	client, _ := testSetup()
 	_ = client.get("/")

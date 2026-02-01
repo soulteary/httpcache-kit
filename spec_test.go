@@ -36,7 +36,7 @@ func testSetup() (*client, *upstreamServer) {
 	if testing.Verbose() {
 		testLogger := logger.NewDefault()
 		handler = logger.Middleware(logger.MiddlewareConfig{Logger: testLogger})(cacheHandler)
-		httpcache.DebugLogging = true
+		httpcache.SetDebugLogging(true)
 	} else {
 		log.SetOutput(io.Discard)
 	}

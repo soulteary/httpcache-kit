@@ -33,10 +33,10 @@ func TestNewHandlerWithOptions_WithLogger(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("code: %d", rec.Code)
 	}
-	// Trigger logRef with DebugLogging so handler uses injected logger for debugf
-	prev := DebugLogging
-	DebugLogging = true
-	defer func() { DebugLogging = prev }()
+	// Trigger logRef with IsDebugLogging so handler uses injected logger for debugf
+	prev := IsDebugLogging()
+	SetDebugLogging(true)
+	defer func() { SetDebugLogging(prev) }()
 	req2 := httptest.NewRequest("GET", "http://example.org/", nil)
 	rec2 := httptest.NewRecorder()
 	h.ServeHTTP(rec2, req2)

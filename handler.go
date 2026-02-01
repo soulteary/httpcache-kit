@@ -88,7 +88,7 @@ func (h *Handler) logRef() *logger.Logger {
 }
 
 func (h *Handler) debugf(format string, args ...interface{}) {
-	if DebugLogging {
+	if IsDebugLogging() {
 		h.logRef().Debug().Msgf(format, args...)
 	}
 }
@@ -321,8 +321,8 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest) {
 	rw.WaitHeaders()
 	h.debugf("upstream responded headers in %s", Clock().Sub(t).String())
 
-	// just the headers!
-	res := NewResourceBytes(rw.StatusCode, nil, rw.Header())
+	// just the headers! Use a clone so storeResource can mutate (e.g. RemovePrivateHeaders) without racing with the client reading rw.Header().
+	res := NewResourceBytes(rw.StatusCode, nil, rw.Header().Clone())
 	if !h.isCacheable(res, r) {
 		h.debugf("resource is uncacheable")
 		rw.Header().Set(CacheHeader, "SKIP")
@@ -395,7 +395,9 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest) {
 	}
 
 	if age, err := correctedAge(res.Header(), t, Clock()); err == nil {
-		res.Header().Set("Age", strconv.Itoa(int(math.Ceil(age.Seconds()))))
+		ageStr := strconv.Itoa(int(math.Ceil(age.Seconds())))
+		res.Header().Set("Age", ageStr)
+		rw.Header().Set("Age", ageStr)
 	} else {
 		h.debugf("error calculating corrected age: %s", err.Error())
 	}
@@ -417,7 +419,9 @@ func (h *Handler) finishPassUpstream(res *Resource, r *cacheRequest, rw *respons
 	}
 
 	if age, err := correctedAge(res.Header(), t, Clock()); err == nil {
-		res.Header().Set("Age", strconv.Itoa(int(math.Ceil(age.Seconds()))))
+		ageStr := strconv.Itoa(int(math.Ceil(age.Seconds())))
+		res.Header().Set("Age", ageStr)
+		rw.Header().Set("Age", ageStr)
 	} else {
 		h.debugf("error calculating corrected age: %s", err.Error())
 	}
@@ -723,10 +727,13 @@ func (rw *responseStreamer) WaitHeaders() {
 }
 
 // WriteHeader implements http.ResponseWriter. Safe if called more than once; only the first call closes C and writes the status.
+// C is closed only after status and headers are written so that WaitHeaders() callers observe consistent state (no data race).
 func (rw *responseStreamer) WriteHeader(status int) {
-	rw.headerOnce.Do(func() { close(rw.C) })
-	rw.StatusCode = status
-	rw.ResponseWriter.WriteHeader(status)
+	rw.headerOnce.Do(func() {
+		rw.StatusCode = status
+		rw.ResponseWriter.WriteHeader(status)
+		close(rw.C)
+	})
 }
 
 func (rw *responseStreamer) Write(b []byte) (int, error) {
