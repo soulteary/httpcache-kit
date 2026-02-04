@@ -53,11 +53,22 @@ func TestVaryKey(t *testing.T) {
 func TestRequestKeyWithContentLocation(t *testing.T) {
 	r := newRequest("GET", "http://x.org/test1", "Content-Location: http://x.org/test2")
 
+	k1 := httpcache.NewKey("GET", mustParseUrl("http://x.org/test2"), nil)
+	k2 := httpcache.NewRequestKey(r)
+
+	if k1.String() != k2.String() {
+		t.Fatal("request key should with content location")
+	}
+}
+
+func TestRequestKeyWithIllegalContentLocation(t *testing.T) {
+	r := newRequest("GET", "http://x.org/test1", "Content-Location: http://y.org/test2")
+
 	k1 := httpcache.NewKey("GET", mustParseUrl("http://x.org/test1"), nil)
 	k2 := httpcache.NewRequestKey(r)
 
 	if k1.String() != k2.String() {
-		t.Fatal("request key should ignore content location")
+		t.Fatal("request key should with illegal content location")
 	}
 }
 
