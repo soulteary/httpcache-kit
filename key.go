@@ -21,26 +21,7 @@ func NewKey(method string, u *url.URL, h http.Header) Key {
 
 // NewRequestKey generates a Key for a request
 func NewRequestKey(r *http.Request) Key {
-	URL := r.URL
-
-	if location := r.Header.Get("Content-Location"); location != "" {
-		u, err := url.Parse(location)
-		if err == nil {
-			if !u.IsAbs() {
-				u = r.URL.ResolveReference(u)
-			}
-			if u.Host != r.Host {
-				debugf("illegal host %q in Content-Location", u.Host)
-			} else {
-				debugf("using Content-Location: %q", u.String())
-				URL = u
-			}
-		} else {
-			debugf("failed to parse Content-Location %q", location)
-		}
-	}
-
-	return NewKey(r.Method, URL, r.Header)
+	return NewKey(r.Method, r.URL, r.Header)
 }
 
 // ForMethod returns a new Key with a given method
@@ -54,7 +35,11 @@ func (k Key) ForMethod(method string) Key {
 func (k Key) Vary(varyHeader string, r *http.Request) Key {
 	k2 := k
 
-	for _, header := range strings.Split(varyHeader, ", ") {
+	for _, header := range strings.Split(varyHeader, ",") {
+		header = strings.TrimSpace(header)
+		if header == "" {
+			continue
+		}
 		k2.vary = append(k2.vary, header+"="+r.Header.Get(header))
 	}
 
