@@ -1,6 +1,6 @@
 module github.com/soulteary/httpcache-kit
 
-go 1.26
+go 1.26.6
 
 require (
 	github.com/prometheus/client_golang v1.24.1
