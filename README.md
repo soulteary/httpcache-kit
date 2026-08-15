@@ -1,5 +1,7 @@
 # httpcache-kit
 
+[![Go Report Card](.github/goreportcard.svg)](.github/goreportcard-report.md)
+
 RFC7234-compliant HTTP cache handler for Go, with memory and disk backends (via [vfs-kit](https://github.com/soulteary/vfs-kit)), Cache-Control parsing, and Prometheus metrics. Evolved from [lox/httpcache](https://github.com/lox/httpcache) (MIT).
 
 ## Installation
