@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	logger "github.com/soulteary/logger-kit"
+	logger "github.com/soulteary/logger-kit/v2"
 
-	"github.com/soulteary/httpcache-kit"
+	"github.com/soulteary/httpcache-kit/v2"
 )
 
 func testSetup() (*client, *upstreamServer) {

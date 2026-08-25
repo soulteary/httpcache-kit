@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	. "github.com/soulteary/httpcache-kit"
+	. "github.com/soulteary/httpcache-kit/v2"
 )
 
 func TestParsingCacheControl(t *testing.T) {

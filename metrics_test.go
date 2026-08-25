@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/soulteary/httpcache-kit"
-	metrics "github.com/soulteary/metrics-kit"
+	"github.com/soulteary/httpcache-kit/v2"
+	metrics "github.com/soulteary/metrics-kit/v2"
 )
 
 func TestNewCacheMetrics(t *testing.T) {

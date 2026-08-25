@@ -7,8 +7,10 @@ RFC7234-compliant HTTP cache handler for Go, with memory and disk backends (via 
 ## Installation
 
 ```bash
-go get github.com/soulteary/httpcache-kit
+go get github.com/soulteary/httpcache-kit/v2
 ```
+
+The v2 module line uses the Fiber v3-compatible `logger-kit/v2` and `metrics-kit/v2` types exposed by the cache API. Applications that still use the v1 kit ecosystem should remain on `github.com/soulteary/httpcache-kit` v1.
 
 ## Example
 
@@ -20,7 +22,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 
-	httpcache "github.com/soulteary/httpcache-kit"
+	httpcache "github.com/soulteary/httpcache-kit/v2"
 )
 
 func main() {
