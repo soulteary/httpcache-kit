@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/soulteary/httpcache-kit"
+	"github.com/soulteary/httpcache-kit/v2"
 )
 
 func TestCacheCleanupLRU(t *testing.T) {

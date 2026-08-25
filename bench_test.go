@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/soulteary/httpcache-kit"
+	"github.com/soulteary/httpcache-kit/v2"
 )
 
 func BenchmarkCachingFiles(b *testing.B) {

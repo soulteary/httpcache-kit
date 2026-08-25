@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/soulteary/httpcache-kit"
+	"github.com/soulteary/httpcache-kit/v2"
 )
 
 func newRequest(method, url string, h ...string) *http.Request {

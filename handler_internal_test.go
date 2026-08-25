@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	logger "github.com/soulteary/logger-kit"
-	metrics "github.com/soulteary/metrics-kit"
+	logger "github.com/soulteary/logger-kit/v2"
+	metrics "github.com/soulteary/metrics-kit/v2"
 )
 
 func TestNewHandlerWithOptions_WithLogger(t *testing.T) {
@@ -401,12 +401,13 @@ func TestCorrectedAge_NoAge(t *testing.T) {
 
 func TestCorrectedAge_ApparentAgeNegative(t *testing.T) {
 	// Date in future -> apparentAge = respTime - date < 0 -> clamp to 0
-	future := time.Now().UTC().Add(1 * time.Hour)
+	now := Clock().UTC()
+	future := now.Add(1 * time.Hour)
 	h := http.Header{}
 	h.Set("Date", future.Format(http.TimeFormat))
 	h.Set("Age", "0")
-	reqTime := time.Now().UTC().Add(-1 * time.Second)
-	respTime := time.Now().UTC()
+	reqTime := now.Add(-1 * time.Second)
+	respTime := now
 	_, err := correctedAge(h, reqTime, respTime)
 	if err != nil {
 		t.Fatal(err)
@@ -415,12 +416,13 @@ func TestCorrectedAge_ApparentAgeNegative(t *testing.T) {
 
 func TestCorrectedAge_ApparentAgeGreaterThanCorrected(t *testing.T) {
 	// apparentAge > correctedAge -> use apparentAge
-	past := time.Now().UTC().Add(-100 * time.Second)
+	now := Clock().UTC()
+	past := now.Add(-100 * time.Second)
 	h := http.Header{}
 	h.Set("Date", past.Format(http.TimeFormat))
 	h.Set("Age", "0")
-	reqTime := time.Now().UTC().Add(-2 * time.Second)
-	respTime := time.Now().UTC()
+	reqTime := now.Add(-2 * time.Second)
+	respTime := now
 	age, err := correctedAge(h, reqTime, respTime)
 	if err != nil {
 		t.Fatal(err)
