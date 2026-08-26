@@ -1,7 +1,9 @@
 package httpcache_test
 
 import (
+	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/soulteary/httpcache-kit/v2"
@@ -13,6 +15,38 @@ func mustParseUrl(u string) *url.URL {
 		panic(err)
 	}
 	return ru
+}
+
+func TestKeyCanonicalizationPreservesCaseSensitiveComponents(t *testing.T) {
+	upper := httpcache.NewKey("GET", mustParseUrl("HTTP://EXAMPLE.COM/Packages/Foo.deb?token=AbC"), nil)
+	lower := httpcache.NewKey("GET", mustParseUrl("http://example.com/packages/foo.deb?token=abc"), nil)
+
+	if upper.String() == lower.String() {
+		t.Fatal("path and query case must remain part of the cache key")
+	}
+	if !strings.HasPrefix(upper.String(), "GET:http://example.com/Packages/Foo.deb?token=AbC") {
+		t.Fatalf("unexpected canonical key: %q", upper.String())
+	}
+
+	hostOnly := httpcache.NewKey("GET", mustParseUrl("http://example.com/Packages/Foo.deb?token=AbC"), nil)
+	if upper.String() != hostOnly.String() {
+		t.Fatal("scheme and host should be canonicalized case-insensitively")
+	}
+}
+
+func TestVaryKeyAcceptsOptionalWhitespace(t *testing.T) {
+	req := &http.Request{Header: http.Header{
+		"Accept-Encoding": []string{"gzip"},
+		"Accept-Language": []string{"zh-CN"},
+	}}
+	base := httpcache.NewKey("GET", mustParseUrl("https://example.com/file"), req.Header)
+	withSpaces := base.Vary("Accept-Encoding, Accept-Language", req).String()
+	withoutSpaces := base.Vary("Accept-Encoding,Accept-Language", req).String()
+	withTabs := base.Vary(" Accept-Encoding ,\tAccept-Language ", req).String()
+
+	if withSpaces != withoutSpaces || withSpaces != withTabs {
+		t.Fatalf("equivalent Vary fields produced different keys:\n%s\n%s\n%s", withSpaces, withoutSpaces, withTabs)
+	}
 }
 
 func TestKeysDiffer(t *testing.T) {

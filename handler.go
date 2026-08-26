@@ -1,7 +1,7 @@
 package httpcache
 
 import (
-	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -57,6 +57,16 @@ type Handler struct {
 	cache     Cache
 	metrics   *CacheMetrics
 	log       *logger.Logger
+
+	lifecycleMu sync.Mutex
+	writes      sync.WaitGroup
+	closing     bool
+	flightsMu   sync.Mutex
+	flights     map[string]*missFlight
+}
+
+type missFlight struct {
+	done chan struct{}
 }
 
 // NewHandler returns a cache handler with default options (package-level logger).
@@ -73,6 +83,7 @@ func NewHandlerWithOptions(cache Cache, upstream http.Handler, opts *HandlerOpti
 		validator: &Validator{upstream},
 		Shared:    false,
 		metrics:   getDefaultMetrics(),
+		flights:   make(map[string]*missFlight),
 	}
 	if opts != nil && opts.Logger != nil {
 		h.log = opts.Logger
@@ -142,7 +153,29 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		if h.metrics != nil {
 			h.metrics.RecordCacheMiss(r.Method)
 		}
-		h.passUpstream(rw, cReq)
+		flight, leader := h.claimMiss(cReq.Key.String())
+		if !leader {
+			select {
+			case <-flight.done:
+				res, err = h.lookup(cReq)
+				if err == nil {
+					res.Header().Set(CacheHeader, "HIT")
+					if h.metrics != nil {
+						h.metrics.RecordCacheHit(r.Method)
+					}
+					h.serveResource(res, rw, cReq)
+					_ = res.Close()
+					return
+				}
+				// The leader could not cache the response. Fall through to an
+				// uncoupled upstream request so followers are never stranded.
+				h.passUpstream(rw, cReq, nil)
+				return
+			case <-r.Context().Done():
+				return
+			}
+		}
+		h.passUpstream(rw, cReq, func() { h.finishMiss(cReq.Key.String(), flight) })
 		return
 	} else {
 		h.debugf("%s %s found in %s cache", r.Method, r.URL.String(), cacheType)
@@ -161,7 +194,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			_ = h.cache.Freshen(res, cReq.Key.String())
 		} else {
 			h.debugf("response is changed")
-			h.passUpstream(rw, cReq)
+			h.passUpstream(rw, cReq, nil)
 			return
 		}
 	}
@@ -294,9 +327,10 @@ func (h *Handler) pipeUpstream(w http.ResponseWriter, r *cacheRequest) {
 
 // passUpstream makes the request via the upstream handler and stores the result
 // It uses streaming to avoid loading the entire response into memory for large files.
-func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest) {
+func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest, complete func()) {
 	rw, err := newResponseStreamer(w)
 	if err != nil {
+		defer callComplete(complete)
 		h.debugf("error creating response streamer: %v", err)
 		w.Header().Set(CacheHeader, "SKIP")
 		h.upstream.ServeHTTP(w, r.Request)
@@ -304,6 +338,7 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest) {
 	}
 	rdr, err := rw.NextReader()
 	if err != nil {
+		defer callComplete(complete)
 		h.debugf("error creating next stream reader: %v", err)
 		w.Header().Set(CacheHeader, "SKIP")
 		h.upstream.ServeHTTP(w, r.Request)
@@ -329,23 +364,23 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest) {
 		// Drain body so upstream goroutine can finish and client receives the response
 		_, _ = io.Copy(io.Discard, rdr)
 		_ = rdr.Close()
+		callComplete(complete)
 		return
 	}
 
 	// Create temporary file to store body for caching (supports multiple reads for multiple keys)
 	tmpFile, err := os.CreateTemp("", "httpcache-*.tmp")
 	if err != nil {
-		h.debugf("error creating temp file: %v, falling back to in-memory", err)
-		// Fallback to in-memory for small files
-		b, err := io.ReadAll(rdr)
+		h.debugf("error creating temp file: %v, skipping cache", err)
+		// Keep draining the stream so the client receives the complete response,
+		// but never fall back to an unbounded in-memory copy.
+		_, err := io.Copy(io.Discard, rdr)
 		_ = rdr.Close()
 		if err != nil {
 			h.debugf("error reading stream: %v", err)
-			rw.Header().Set(CacheHeader, "SKIP")
-			return
 		}
-		res.ReadSeekCloser = &byteReadSeekCloser{bytes.NewReader(b)}
-		h.finishPassUpstream(res, r, rw, t)
+		rw.Header().Set(CacheHeader, "SKIP")
+		callComplete(complete)
 		return
 	}
 	tmpPath := tmpFile.Name()
@@ -360,6 +395,7 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest) {
 		_ = os.Remove(tmpPath)
 		_ = rdr.Close()
 		rw.Header().Set(CacheHeader, "SKIP")
+		callComplete(complete)
 		return
 	}
 
@@ -369,6 +405,7 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest) {
 		_ = os.Remove(tmpPath)
 		_ = rdr.Close()
 		rw.Header().Set(CacheHeader, "SKIP")
+		callComplete(complete)
 		return
 	}
 	_ = rdr.Close()
@@ -382,6 +419,7 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest) {
 		h.debugf("error reopening temp file for caching: %v", err)
 		_ = os.Remove(tmpPath)
 		rw.Header().Set(CacheHeader, "SKIP")
+		callComplete(complete)
 		return
 	}
 
@@ -407,31 +445,13 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest) {
 	res.Header().Set(ProxyDateHeader, proxyDate) // so cached Resource.Age() uses receive time, not upstream Date
 
 	// Store resource in background - errors won't affect client response
-	h.storeResource(res, r)
+	h.storeResource(res, r, complete)
 }
 
-// finishPassUpstream completes the passUpstream flow for in-memory fallback
-func (h *Handler) finishPassUpstream(res *Resource, r *cacheRequest, rw *responseStreamer, t time.Time) {
-	upstreamDuration := Clock().Sub(t)
-	h.debugf("full upstream response took %s", upstreamDuration.String())
-
-	// Record upstream duration metric
-	if h.metrics != nil {
-		h.metrics.RecordUpstreamDuration(r.Method, rw.StatusCode, upstreamDuration.Seconds())
+func callComplete(complete func()) {
+	if complete != nil {
+		complete()
 	}
-
-	proxyDate := Clock().Format(http.TimeFormat)
-	if age, err := correctedAge(res.Header(), t, Clock()); err == nil {
-		ageStr := strconv.Itoa(int(math.Ceil(age.Seconds())))
-		res.Header().Set("Age", ageStr)
-		rw.Header().Set("Age", ageStr)
-	} else {
-		h.debugf("error calculating corrected age: %s", err.Error())
-	}
-
-	rw.Header().Set(ProxyDateHeader, proxyDate)
-	res.Header().Set(ProxyDateHeader, proxyDate) // so cached Resource.Age() uses receive time, not upstream Date
-	h.storeResource(res, r)
 }
 
 // tempFileReadSeekCloser implements ReadSeekCloser for temporary files
@@ -503,6 +523,9 @@ func (h *Handler) isCacheable(res *Resource, r *cacheRequest) bool {
 	if cc.Has("no-cache") || cc.Has("no-store") {
 		return false
 	}
+	if varyWildcard(res.Header().Get("Vary")) {
+		return false
+	}
 
 	if cc.Has("private") && len(cc["private"]) == 0 && h.Shared {
 		return false
@@ -512,7 +535,8 @@ func (h *Handler) isCacheable(res *Resource, r *cacheRequest) bool {
 		return false
 	}
 
-	if r.Header.Get("Authorization") != "" && h.Shared {
+	if r.Header.Get("Authorization") != "" && h.Shared &&
+		!cc.Has("public") && !cc.Has("s-maxage") {
 		return false
 	}
 
@@ -579,19 +603,27 @@ func (h *Handler) serveResource(res *Resource, w http.ResponseWriter, req *cache
 }
 
 func (h *Handler) invalidateResource(res *Resource, r *cacheRequest) {
-	Writes.Add(1)
+	if !h.beginWrite() {
+		return
+	}
 
 	go func() {
-		defer Writes.Done()
+		defer h.endWrite()
 		h.debugf("invalidating resource %+v", res)
 	}()
 }
 
-func (h *Handler) storeResource(res *Resource, r *cacheRequest) {
-	Writes.Add(1)
+func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func()) {
+	if !h.beginWrite() {
+		_ = res.Close()
+		callComplete(complete)
+		return
+	}
 
 	go func() {
-		defer Writes.Done()
+		defer h.endWrite()
+		defer callComplete(complete)
+		defer func() { _ = res.Close() }()
 		t := Clock()
 		keys := []string{r.Key.String()}
 		headers := res.Header()
@@ -644,6 +676,10 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 
 	// Secondary lookup for Vary
 	if vary := res.Header().Get("Vary"); vary != "" {
+		if varyWildcard(vary) {
+			_ = res.Close()
+			return nil, ErrNotFoundInCache
+		}
 		res, err = h.cache.Retrieve(req.Key.Vary(vary, req.Request).String())
 		if err != nil {
 			return res, err
@@ -679,7 +715,68 @@ func newCacheRequest(r *http.Request) (*cacheRequest, error) {
 }
 
 func (r *cacheRequest) isStateChanging() bool {
-	return r.Method != "POST" && r.Method != "PUT" && r.Method != "DELETE"
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) beginWrite() bool {
+	h.lifecycleMu.Lock()
+	defer h.lifecycleMu.Unlock()
+	if h.closing {
+		return false
+	}
+	h.writes.Add(1)
+	Writes.Add(1) // retained for backward compatibility with existing callers
+	return true
+}
+
+func (h *Handler) endWrite() {
+	h.writes.Done()
+	Writes.Done()
+}
+
+// Shutdown prevents new background cache writes and waits for writes already
+// in progress. The caller should invoke it before closing the cache backend.
+func (h *Handler) Shutdown(ctx context.Context) error {
+	h.lifecycleMu.Lock()
+	h.closing = true
+	h.lifecycleMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		h.writes.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (h *Handler) claimMiss(key string) (*missFlight, bool) {
+	h.flightsMu.Lock()
+	defer h.flightsMu.Unlock()
+	if flight, ok := h.flights[key]; ok {
+		return flight, false
+	}
+	flight := &missFlight{done: make(chan struct{})}
+	h.flights[key] = flight
+	return flight, true
+}
+
+func (h *Handler) finishMiss(key string, flight *missFlight) {
+	h.flightsMu.Lock()
+	if current, ok := h.flights[key]; ok && current == flight {
+		delete(h.flights, key)
+		close(flight.done)
+	}
+	h.flightsMu.Unlock()
 }
 
 func (r *cacheRequest) isCacheable() bool {

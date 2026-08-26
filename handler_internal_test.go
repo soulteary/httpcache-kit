@@ -2,12 +2,15 @@ package httpcache
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -842,7 +845,9 @@ func TestPassUpstream_CreateTempFails(t *testing.T) {
 	}()
 
 	body := []byte("small")
+	var upstreamCalls atomic.Int32
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
 		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
@@ -858,5 +863,146 @@ func TestPassUpstream_CreateTempFails(t *testing.T) {
 	got, _ := io.ReadAll(rec.Body)
 	if string(got) != string(body) {
 		t.Errorf("body: got %q", got)
+	}
+	if rec.Header().Get(CacheHeader) != "SKIP" {
+		t.Fatalf("X-Cache = %q, want SKIP", rec.Header().Get(CacheHeader))
+	}
+
+	// A second request must reach upstream again: a temp-file failure is a
+	// cache bypass, never an unbounded in-memory cache fallback.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest("GET", "http://example.org/", nil))
+	if got := upstreamCalls.Load(); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2", got)
+	}
+}
+
+func TestSharedCacheDoesNotReuseAuthenticatedResponses(t *testing.T) {
+	var calls atomic.Int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "max-age=60")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(r.Header.Get("Authorization")))
+	})
+	h := NewHandler(NewMemoryCache(), upstream)
+	h.Shared = true
+
+	for _, credential := range []string{"Bearer user-a", "Bearer user-b"} {
+		req := httptest.NewRequest(http.MethodGet, "http://example.org/private.deb", nil)
+		req.Header.Set("Authorization", credential)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Body.String() != credential {
+			t.Fatalf("body = %q, want %q", rec.Body.String(), credential)
+		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("authenticated responses were shared: upstream calls = %d, want 2", got)
+	}
+}
+
+func TestVaryWildcardIsNotCached(t *testing.T) {
+	var calls atomic.Int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		w.Header().Set("Vary", "*")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("body"))
+	})
+	h := NewHandler(NewMemoryCache(), upstream)
+	h.Shared = true
+	for i := 0; i < 2; i++ {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://example.org/vary", nil))
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("Vary: * response was cached: upstream calls = %d, want 2", got)
+	}
+}
+
+func TestConcurrentMissesAreCollapsed(t *testing.T) {
+	var calls atomic.Int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		w.WriteHeader(http.StatusOK)
+		time.Sleep(25 * time.Millisecond)
+		_, _ = w.Write([]byte("package"))
+	})
+	cache, err := NewDiskCache(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewDiskCache: %v", err)
+	}
+	if extended, ok := cache.(ExtendedCache); ok {
+		defer func() { _ = extended.Close() }()
+	}
+	h := NewHandler(cache, upstream)
+	h.Shared = true
+
+	const clients = 12
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan string, clients)
+	for i := 0; i < clients; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://example.org/pkg.deb", nil))
+			if rec.Code != http.StatusOK || rec.Body.String() != "package" {
+				errs <- rec.Body.String()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("unexpected follower response: %q", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+}
+
+type blockingStoreCache struct {
+	Cache
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingStoreCache) Store(res *Resource, keys ...string) error {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+	return c.Cache.Store(res, keys...)
+}
+
+func TestHandlerShutdownDrainsWrites(t *testing.T) {
+	cache := &blockingStoreCache{
+		Cache:   NewMemoryCache(),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("package"))
+	})
+	h := NewHandler(cache, upstream)
+	h.Shared = true
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://example.org/pkg.deb", nil))
+	<-cache.started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := h.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want deadline exceeded while store is active", err)
+	}
+	close(cache.release)
+	if err := h.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown after releasing store: %v", err)
 	}
 }
