@@ -4,8 +4,8 @@ go 1.26.6
 
 require (
 	github.com/prometheus/client_golang v1.24.1
-	github.com/soulteary/logger-kit/v2 v2.0.0-20260825184349-8667e28f7f2a
-	github.com/soulteary/metrics-kit/v2 v2.0.0-20260825190213-a45f1f3040f0
+	github.com/soulteary/logger-kit/v2 v2.0.0
+	github.com/soulteary/metrics-kit/v2 v2.0.0
 	github.com/soulteary/vfs-kit v1.2.0
 )
 
