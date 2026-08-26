@@ -1,12 +1,12 @@
 module github.com/soulteary/httpcache-kit/v2
 
-go 1.26.6
+go 1.27.0
 
 require (
 	github.com/prometheus/client_golang v1.24.1
-	github.com/soulteary/logger-kit/v2 v2.0.0
-	github.com/soulteary/metrics-kit/v2 v2.0.0
-	github.com/soulteary/vfs-kit v1.2.0
+	github.com/soulteary/logger-kit/v2 v2.1.0
+	github.com/soulteary/metrics-kit/v2 v2.1.0
+	github.com/soulteary/vfs-kit v1.3.0
 )
 
 require (
