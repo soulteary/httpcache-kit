@@ -299,24 +299,28 @@ func (c *cache) Header(key string) (Header, error) {
 	return h, nil
 }
 
-// Store a resource against a number of keys.
-// When multiple keys are given (e.g. primary + Vary key), the same body is written
-// for each key by using a fresh reader per key (buf is consumed on first read).
+// Store a resource against a number of keys. Resource bodies are streamed
+// directly into the backing VFS. For multiple keys (for example a primary and
+// Vary key), the seekable resource is rewound instead of being copied into an
+// unbounded in-memory buffer.
 func (c *cache) Store(res *Resource, keys ...string) error {
-	var buf = &bytes.Buffer{}
-
-	if length, err := strconv.ParseInt(res.Header().Get("Content-Length"), 10, 64); err == nil {
-		if _, err = io.CopyN(buf, res, length); err != nil {
-			return err
-		}
-	} else if _, err = io.Copy(buf, res); err != nil {
-		return err
+	if len(keys) == 0 {
+		return nil
 	}
 
-	bodyBytes := buf.Bytes()
-	bodySize := int64(len(bodyBytes))
+	expectedSize, hasExpectedSize := int64(0), false
+	if rawLength := res.Header().Get("Content-Length"); rawLength != "" {
+		length, err := strconv.ParseInt(rawLength, 10, 64)
+		if err == nil && length >= 0 {
+			expectedSize, hasExpectedSize = length, true
+		}
+	}
 
 	for _, key := range keys {
+		if _, err := res.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to rewind resource for key %q: %w", key, err)
+		}
+
 		// Remove from stale map
 		c.staleMutex.Lock()
 		delete(c.stale, key)
@@ -324,14 +328,27 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 
 		hashedKey := hashKey(key)
 
-		// Check if we need to evict items before storing
-		c.evictIfNeeded(bodySize)
+		// If Content-Length is known, make room before the write. Unknown-length
+		// streams are accounted for and evicted immediately after the write.
+		if hasExpectedSize {
+			c.evictIfNeeded(expectedSize)
+		}
 
-		// Use a fresh reader per key: io.Reader is consumed by storeBody, so later keys
-		// would get empty body if we reused the same buffer.
-		written, err := c.storeBody(bytes.NewReader(bodyBytes), key)
+		var body io.Reader = res
+		if hasExpectedSize {
+			body = io.LimitReader(res, expectedSize)
+		}
+		written, err := c.storeBody(body, key)
 		if err != nil {
 			return err
+		}
+		if hasExpectedSize && written != expectedSize {
+			bodyPath := bodyPrefix + formatPrefix + hashedKey
+			_ = c.fs.Remove(bodyPath)
+			return fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize)
+		}
+		if !hasExpectedSize {
+			c.evictIfNeeded(written)
 		}
 
 		headerBytes, err := c.storeHeader(res.Status(), res.Header(), key)

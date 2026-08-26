@@ -54,7 +54,7 @@ func (k Key) ForMethod(method string) Key {
 func (k Key) Vary(varyHeader string, r *http.Request) Key {
 	k2 := k
 
-	for _, header := range strings.Split(varyHeader, ", ") {
+	for _, header := range parseVary(varyHeader) {
 		k2.vary = append(k2.vary, header+"="+r.Header.Get(header))
 	}
 
@@ -62,7 +62,7 @@ func (k Key) Vary(varyHeader string, r *http.Request) Key {
 }
 
 func (k Key) String() string {
-	URL := strings.ToLower(canonicalURL(&k.u).String())
+	URL := canonicalURL(&k.u).String()
 	var b strings.Builder
 	b.Grow(len(k.method) + 1 + len(URL) + 3 + 10*len(k.vary)) // heuristic to reduce allocs
 	b.WriteString(k.method)
@@ -79,5 +79,33 @@ func (k Key) String() string {
 }
 
 func canonicalURL(u *url.URL) *url.URL {
-	return u
+	// URI schemes and host names are case-insensitive, but paths and query
+	// strings are not. Lower-casing the entire URL aliases distinct repository
+	// objects and can make one response overwrite another in a shared cache.
+	canonical := *u
+	canonical.Scheme = strings.ToLower(canonical.Scheme)
+	canonical.Host = strings.ToLower(canonical.Host)
+	canonical.Fragment = ""
+	return &canonical
+}
+
+func parseVary(varyHeader string) []string {
+	parts := strings.Split(varyHeader, ",")
+	headers := make([]string, 0, len(parts))
+	for _, part := range parts {
+		header := http.CanonicalHeaderKey(strings.TrimSpace(part))
+		if header != "" {
+			headers = append(headers, header)
+		}
+	}
+	return headers
+}
+
+func varyWildcard(varyHeader string) bool {
+	for _, header := range parseVary(varyHeader) {
+		if header == "*" {
+			return true
+		}
+	}
+	return false
 }
