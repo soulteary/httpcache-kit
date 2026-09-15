@@ -384,6 +384,13 @@ func (c *cache) Header(key string) (Header, error) {
 
 // readHeaderFile reads a stored response header and its separate cache
 // metadata preamble.
+// headerRecordTerminator ends a serialized header record. headersToWriter
+// emits http.Header.Write's output followed by a bare CRLF, so a complete
+// record always ends with a blank line. No truncation of that record can end
+// with one: header lines are written back to back, so cutting after any of
+// them leaves a single CRLF, not two.
+const headerRecordTerminator = "\r\n\r\n"
+
 func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 	f, err := c.fs.Open(path)
 	if err != nil {
@@ -394,26 +401,39 @@ func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	h, storedAt, err := readStoredHeaders(bufio.NewReader(f))
+	// Read the record whole. Headers are small, and completeness has to be
+	// judged before parsing: a partial record can parse into a plain error
+	// (a cut timestamp reads as a malformed one) that is indistinguishable
+	// from corruption once the bytes are gone.
+	raw, err := io.ReadAll(f)
 	if err != nil {
-		// The header file is this entry's commit marker: Store writes the body
-		// in full first and the header last, so a reader that finds a complete
-		// header knows the body behind it is complete too.
-		//
-		// vfsWrite opens with O_CREATE|O_TRUNC, which publishes an empty file
-		// before any bytes are copied into it. A concurrent Retrieve landing in
-		// that window opens the body (already written), then reads a header
-		// that is empty or cut short. That is not corruption, it is an entry
-		// that is not committed yet, and it is indistinguishable to a reader
-		// from one that was never stored -- so report the miss that callers
-		// already handle instead of a hard error.
-		//
-		// Reporting an error here surfaced as a 502/500 to the client for a
-		// perfectly cacheable resource whenever two requests for the same
-		// uncached URL overlapped, which is the common case for a shared cache.
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return Header{}, time.Time{}, ErrNotFoundInCache
-		}
+		return Header{}, time.Time{}, fmt.Errorf("failed to read header file %q for key %q: %w", path, key, err)
+	}
+
+	// The header file is this entry's commit marker. Store writes the body in
+	// full first and the header last, so a reader that finds a complete header
+	// knows the body behind it is complete too.
+	//
+	// vfsWrite opens with O_CREATE|O_TRUNC, publishing the file before any
+	// bytes are copied into it, and neither that copy nor an arbitrary VFS
+	// backend's write is atomic. A concurrent Retrieve landing in that window
+	// opens the body, which is already written, and then reads a header that
+	// is empty or cut short anywhere.
+	//
+	// That is not corruption. The entry is not committed yet, and from a
+	// reader's side it is indistinguishable from one that was never stored, so
+	// report the miss that callers already handle. Reporting an error here
+	// surfaced to the client as a failed response for a perfectly cacheable
+	// resource whenever two requests for the same uncached URL overlapped,
+	// which is the ordinary case for a shared cache.
+	if !bytes.HasSuffix(raw, []byte(headerRecordTerminator)) {
+		return Header{}, time.Time{}, ErrNotFoundInCache
+	}
+
+	h, storedAt, err := readStoredHeaders(bufio.NewReader(bytes.NewReader(raw)))
+	if err != nil {
+		// The record is terminated, so this is a complete header that does not
+		// parse: corruption, not a write in flight.
 		return Header{}, time.Time{}, fmt.Errorf("failed to read headers from %q for key %q: %w", path, key, err)
 	}
 

@@ -90,6 +90,104 @@ func TestRetrieveTreatsUnterminatedHeaderAsMiss(t *testing.T) {
 	}
 }
 
+// Codex review on #9: a reader can also observe a nonempty prefix that parses
+// far enough to fail on content rather than on EOF -- a record cut inside the
+// timestamp reads as "malformed cache timestamp". That is still a write in
+// flight, so it must be a miss too. Recognising only EOF-shaped truncations
+// left this one surfacing as a failed response.
+func TestRetrieveTreatsTruncatedTimestampAsMiss(t *testing.T) {
+	fs := vfs.Memory()
+	c := NewVFSCacheWithConfig(fs, DefaultCacheConfig())
+
+	const key = "GET:http://example.com/dists/stable/Release"
+	if err := c.Store(storedResource("index"), key); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	headerPath := headerPrefix + formatPrefix + hashKey(key)
+	full, err := vfs.ReadFile(fs, headerPath)
+	if err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+
+	// Cut inside the RFC3339 timestamp on the first line.
+	cut := bytes.IndexByte(full, '\n')
+	if cut < 12 {
+		t.Fatalf("unexpected header layout: %q", full)
+	}
+	for _, keep := range []int{len(storedAtPreamble) + 4, cut - 3, cut - 1} {
+		f, err := fs.OpenFile(headerPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatalf("rewrite header: %v", err)
+		}
+		if _, err := io.Copy(f, bytes.NewReader(full[:keep])); err != nil {
+			t.Fatalf("write truncated header: %v", err)
+		}
+		_ = f.Close()
+
+		res, err := c.Retrieve(key)
+		if res != nil {
+			_ = res.Close()
+		}
+		if err != ErrNotFoundInCache {
+			t.Errorf("truncated to %d bytes: Retrieve returned %v, want ErrNotFoundInCache", keep, err)
+		}
+	}
+}
+
+// Every truncation length of a real record must read as a miss, never as an
+// error. This is the property the terminator check buys.
+func TestRetrieveTreatsEveryTruncationAsMiss(t *testing.T) {
+	fs := vfs.Memory()
+	c := NewVFSCacheWithConfig(fs, DefaultCacheConfig())
+
+	const key = "GET:http://example.com/pool/main/p.deb"
+	if err := c.Store(storedResource("body"), key); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	headerPath := headerPrefix + formatPrefix + hashKey(key)
+	full, err := vfs.ReadFile(fs, headerPath)
+	if err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+
+	for keep := 0; keep < len(full); keep++ {
+		f, err := fs.OpenFile(headerPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatalf("rewrite header: %v", err)
+		}
+		if _, err := io.Copy(f, bytes.NewReader(full[:keep])); err != nil {
+			t.Fatalf("write truncated header: %v", err)
+		}
+		_ = f.Close()
+
+		res, err := c.Retrieve(key)
+		if res != nil {
+			_ = res.Close()
+		}
+		if err != ErrNotFoundInCache {
+			t.Fatalf("truncated to %d/%d bytes: Retrieve returned %v, want ErrNotFoundInCache",
+				keep, len(full), err)
+		}
+	}
+
+	// The untruncated record still serves.
+	f, err := fs.OpenFile(headerPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("restore header: %v", err)
+	}
+	if _, err := io.Copy(f, bytes.NewReader(full)); err != nil {
+		t.Fatalf("restore header: %v", err)
+	}
+	_ = f.Close()
+	res, err := c.Retrieve(key)
+	if err != nil {
+		t.Fatalf("complete header should serve, got %v", err)
+	}
+	_ = res.Close()
+}
+
 // A genuinely malformed header (complete, but not parseable) is still an
 // error: that one is corruption, not an in-flight write.
 func TestRetrieveStillErrorsOnMalformedHeader(t *testing.T) {
