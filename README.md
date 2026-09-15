@@ -170,11 +170,22 @@ stale-markers.json        invalidation state
 ```
 
 An entry is its body plus its header, and the two are published together by
-rename, so a reader sees the whole previous entry or the whole new one. Nothing
-under `staging/v1` is a cache entry: it is never scanned, and whatever an
-interrupted process left there is removed at startup.
+rename, so a reader sees the whole previous entry or the whole new one. That
+holds **between goroutines sharing one live cache**, and no further:
 
-Only `body/v1` and `header/v1` count toward `MaxSize` and `Stats()`.
+- The two renames are sequential. A process that exits between them leaves the
+  new body beside the old header, and startup removes the leftover staging file
+  rather than repairing the pair.
+- The lock is per-instance. Two caches opened on one directory do not
+  coordinate, and their publications can interleave.
+
+Nothing under `staging/v1` is a cache entry: it is never scanned, and whatever
+an interrupted process left there is removed at startup.
+
+Only `body/v1` and `header/v1` count toward `MaxSize` and `Stats().TotalSize`.
+The other `Stats()` fields are independent of these directories —
+`StaleCount` tracks `stale-markers.json`, and `HitCount`/`MissCount` are
+counters.
 
 ## Configuration
 
@@ -356,7 +367,9 @@ differently, and there is a new directory inside the cache directory.
   the copy took. Replacing a 128 KiB entry under eight concurrent readers
   produced 2 misses and 258 reads that saw neither the old nor the new body in
   full; a watcher caught the header file empty 4543 times across 200 re-stores.
-  A reader now sees the whole previous entry or the whole new one.
+  A reader sharing the cache now sees the whole previous entry or the whole new
+  one — see the on-disk layout section for the two limits on that, a crash
+  between the two renames and two instances on one directory.
 - **A body and its header change together.** `Retrieve` opens the body first and
   reads the header second, so a publish landing between those two steps used to
   hand back one version's payload with the other's status and headers — a
