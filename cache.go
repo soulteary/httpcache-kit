@@ -32,6 +32,11 @@ const (
 	headerPrefix = "header/"
 	bodyPrefix   = "body/"
 	formatPrefix = "v1/"
+	// stagingPrefix holds entry files that are written but not yet published.
+	// It sits outside body/ and header/ so scanExistingCache never mistakes a
+	// staging file for an entry, and sweepStaging clears whatever an
+	// interrupted process left behind.
+	stagingPrefix = "staging/"
 
 	// storedAtPreamble persists the cache's full-precision local write or
 	// validation time before the serialized HTTP response. Keeping metadata
@@ -121,6 +126,12 @@ type cache struct {
 	// can already observe its published barrier.
 	cleanupMu sync.RWMutex
 
+	// publishMu makes an entry's body and header change together. Store holds
+	// the write side across both renames; Retrieve holds the read side across
+	// opening the body and reading the header, so it cannot pair one version's
+	// body with the other's header.
+	publishMu sync.RWMutex
+
 	// stale map with mutex protection
 	stale           map[string]time.Time
 	staleGeneration uint64
@@ -183,6 +194,7 @@ func newVFSCacheWithConfig(fs vfs.VFS, config *CacheConfig, diskRoot string) Ext
 	// here rather than only in NewDiskCacheWithConfig; otherwise its body and
 	// header files survive reconstruction while the invalidation markers do
 	// not, republishing pre-mutation entries as fresh.
+	c.sweepStaging()
 	if err := c.scanExistingCache(); err != nil {
 		debugf("warning: failed to scan existing cache: %v", err)
 	}
@@ -316,6 +328,112 @@ func (c *cache) scanDirectory(dir string, callback func(hashedKey string, info o
 	return nil
 }
 
+// stagedEntry is one entry file written and waiting to be published.
+//
+// On a disk-backed cache the bytes live in a staging file that commitStaged
+// renames into place; published stays false until then, so a failure anywhere
+// before the commit leaves the entry that is already there untouched. Other
+// VFS backends have no rename in the interface and write in place, so their
+// contents are published the moment they are written and published is true.
+type stagedEntry struct {
+	tmpPath   string
+	target    string
+	published bool
+}
+
+// stageWrite writes path's new contents, publishing them immediately only on
+// a backend that cannot stage. See stagedEntry.
+//
+// The in-place write is what made publication non-atomic: O_CREATE|O_TRUNC
+// makes an empty file visible before any bytes are copied into it, which on a
+// first store exposes a window where the entry looks present but unreadable,
+// and on a re-store destroys a perfectly good entry for the duration of the
+// write. readHeaderFile's terminator check still turns that window into a
+// miss on backends that keep it.
+func (c *cache) stageWrite(path string, r io.Reader) (*stagedEntry, int64, error) {
+	if err := vfs.MkdirAll(c.fs, pathutil.Dir(path), 0700); err != nil {
+		return nil, 0, fmt.Errorf("failed to create cache directory for %q: %w", path, err)
+	}
+	if c.diskRoot == "" {
+		n, published, err := c.vfsWrite(path, r)
+		return &stagedEntry{published: published}, n, err
+	}
+	if err := vfs.MkdirAll(c.fs, stagingPrefix+formatPrefix, 0700); err != nil {
+		return nil, 0, fmt.Errorf("failed to create staging directory: %w", err)
+	}
+	stagingDir := filepath.Join(c.diskRoot, filepath.FromSlash(stagingPrefix+formatPrefix))
+	target := filepath.Join(c.diskRoot, filepath.FromSlash(path))
+	tmpPath, n, err := writeStagingFile(stagingDir, target, r)
+	if err != nil {
+		return nil, n, err
+	}
+	return &stagedEntry{tmpPath: tmpPath, target: target}, n, nil
+}
+
+// commitStaged publishes every staged file as one step, so a reader holding
+// publishMu's read side sees the whole previous entry or the whole new one.
+func (c *cache) commitStaged(entries ...*stagedEntry) error {
+	c.publishMu.Lock()
+	defer c.publishMu.Unlock()
+	for _, e := range entries {
+		if e == nil || e.tmpPath == "" {
+			continue
+		}
+		if err := os.Rename(e.tmpPath, e.target); err != nil {
+			return fmt.Errorf("failed to publish cache file %q: %w", e.target, err)
+		}
+		e.tmpPath = ""
+		e.published = true
+	}
+	return nil
+}
+
+// abandonStaged drops files that never made it to a commit.
+func (c *cache) abandonStaged(entries ...*stagedEntry) {
+	for _, e := range entries {
+		if e == nil || e.tmpPath == "" {
+			continue
+		}
+		if err := os.Remove(e.tmpPath); err != nil && !os.IsNotExist(err) {
+			debugf("failed to remove staging file %s: %v", e.tmpPath, err)
+		}
+		e.tmpPath = ""
+	}
+}
+
+// anyPublished reports whether a failed store already changed something on
+// disk, which is only possible on a backend that writes in place.
+func anyPublished(entries ...*stagedEntry) bool {
+	for _, e := range entries {
+		if e != nil && e.published {
+			return true
+		}
+	}
+	return false
+}
+
+// sweepStaging removes staging files an interrupted process left behind. They
+// sit outside the scanned directories, so they never reach the LRU index, but
+// nothing else would reclaim their space either.
+func (c *cache) sweepStaging() {
+	if c.diskRoot == "" {
+		return
+	}
+	dir := stagingPrefix + formatPrefix
+	files, err := c.fs.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, info := range files {
+		if info.IsDir() {
+			continue
+		}
+		if err := c.fs.Remove(dir + info.Name()); err != nil {
+			debugf("failed to remove stale staging file %s: %v", dir+info.Name(), err)
+		}
+	}
+}
+
 // vfsWrite reports whether OpenFile succeeded and may therefore have
 // truncated or partially replaced the target. Callers updating an existing
 // cache entry use that bit to discard stale metadata after delayed copy/close
@@ -340,8 +458,40 @@ func (c *cache) vfsWrite(path string, r io.Reader) (int64, bool, error) {
 }
 
 // atomicWriteFile writes a complete sibling temporary file before replacing
-// path. A failed copy, sync, or close therefore leaves the last valid target
-// untouched; os.Rename makes the final same-filesystem replacement atomic.
+// path, and fsyncs it first. A failed copy, sync, or close therefore leaves
+// the last valid target untouched; os.Rename makes the final same-filesystem
+// replacement atomic.
+//
+// The stale map takes this: losing invalidation state would republish
+// superseded content, so it is worth the fsync. Cache entries go through
+// writeStagingFile instead, which skips it.
+// writeStagingFile writes r into a fresh file under stagingDir and returns its
+// path. The caller renames it onto target to publish it, or removes it. The
+// name carries target's base so a leftover file is traceable.
+//
+// No fsync: rename is what makes a reader see either the old entry or the
+// whole new one, and that is all a cache entry needs. Durability across a
+// crash is not worth its price here -- an entry lost to a crash is a miss, and
+// the fsync costs several times the write itself.
+func writeStagingFile(stagingDir, target string, r io.Reader) (string, int64, error) {
+	f, err := os.CreateTemp(stagingDir, filepath.Base(target)+".tmp-*")
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to create staging file for %q: %w", target, err)
+	}
+	tmpPath := f.Name()
+	n, copyErr := io.Copy(f, r)
+	closeErr := f.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmpPath)
+		return "", n, fmt.Errorf("failed to write staging file for %q: %w", target, copyErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return "", n, fmt.Errorf("failed to close staging file for %q: %w", target, closeErr)
+	}
+	return tmpPath, n, nil
+}
+
 func atomicWriteFile(path string, r io.Reader) (int64, error) {
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
@@ -511,37 +661,44 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 		if hasExpectedSize {
 			body = io.LimitReader(res, expectedSize)
 		}
-		written, bodyModified, err := c.storeBody(body, key)
-		if err != nil {
-			if bodyModified {
+		// Body and header are written first and published together further
+		// down. Until that commit the entry already on disk is untouched, so
+		// every failure here just drops the staged files. On a backend that
+		// writes in place there is nothing to stage, and the existing discard
+		// path still applies -- anyPublished says which case this is.
+		bodyStaged, written, err := c.stageBody(body, key)
+		fail := func(err error) error {
+			c.abandonStaged(bodyStaged)
+			if anyPublished(bodyStaged) {
 				if discardErr := c.discardUnadmitted(key, hashedKey, written+int64(len(headerData)), storedAt); discardErr != nil {
-					err = errors.Join(err, fmt.Errorf("discard entry after failed body write for key %q: %w", key, discardErr))
+					err = errors.Join(err, fmt.Errorf("discard entry after failed store for key %q: %w", key, discardErr))
 				}
 			}
 			return err
 		}
+		if err != nil {
+			return fail(err)
+		}
 		if hasExpectedSize && written != expectedSize {
-			err := fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize)
-			if discardErr := c.discardUnadmitted(key, hashedKey, written+int64(len(headerData)), storedAt); discardErr != nil {
-				err = errors.Join(err, fmt.Errorf("discard incomplete entry for key %q: %w", key, discardErr))
-			}
-			return err
+			return fail(fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize))
 		}
 		if !hasExpectedSize {
 			if err := c.evictIfNeeded(hashedKey, written+int64(len(headerData))); err != nil {
-				if discardErr := c.discardUnadmitted(key, hashedKey, written+int64(len(headerData)), storedAt); discardErr != nil {
-					err = errors.Join(err, fmt.Errorf("discard unadmitted entry for key %q: %w", key, discardErr))
-				}
-				return fmt.Errorf("failed to make room for key %q: %w", key, err)
+				return fail(fmt.Errorf("failed to make room for key %q: %w", key, err))
 			}
 		}
 
-		headerBytes, _, err := c.storeSerializedHeader(headerData, key)
+		headerStaged, headerBytes, err := c.stageSerializedHeader(headerData, key)
 		if err != nil {
-			if discardErr := c.discardUnadmitted(key, hashedKey, written+int64(len(headerData)), storedAt); discardErr != nil {
-				err = errors.Join(err, fmt.Errorf("discard entry with incomplete header for key %q: %w", key, discardErr))
-			}
-			return err
+			c.abandonStaged(headerStaged)
+			return fail(err)
+		}
+
+		// One step, under publishMu: a reader sees the whole previous entry or
+		// the whole new one, never one version's body with the other's header.
+		if err := c.commitStaged(bodyStaged, headerStaged); err != nil {
+			c.abandonStaged(bodyStaged, headerStaged)
+			return fail(err)
 		}
 
 		// Update LRU tracking
@@ -551,12 +708,12 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 	return nil
 }
 
-func (c *cache) storeBody(r io.Reader, key string) (int64, bool, error) {
-	n, modified, err := c.vfsWrite(bodyPrefix+formatPrefix+hashKey(key), r)
+func (c *cache) stageBody(r io.Reader, key string) (*stagedEntry, int64, error) {
+	e, n, err := c.stageWrite(bodyPrefix+formatPrefix+hashKey(key), r)
 	if err != nil {
-		return n, modified, fmt.Errorf("failed to store body for key %q: %w", key, err)
+		return e, n, fmt.Errorf("failed to store body for key %q: %w", key, err)
 	}
-	return n, modified, nil
+	return e, n, nil
 }
 
 func (c *cache) storeHeader(code int, h http.Header, key string, storedAt time.Time) (int64, bool, error) {
@@ -577,12 +734,28 @@ func serializeStoredHeader(code int, h http.Header, storedAt time.Time) ([]byte,
 	return hb.Bytes(), nil
 }
 
-func (c *cache) storeSerializedHeader(headerData []byte, key string) (int64, bool, error) {
-	n, modified, err := c.vfsWrite(headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(headerData))
+func (c *cache) stageSerializedHeader(headerData []byte, key string) (*stagedEntry, int64, error) {
+	e, n, err := c.stageWrite(headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(headerData))
 	if err != nil {
-		return n, modified, fmt.Errorf("failed to store header for key %q: %w", key, err)
+		return e, n, fmt.Errorf("failed to store header for key %q: %w", key, err)
 	}
-	return n, modified, nil
+	return e, n, nil
+}
+
+// storeSerializedHeader writes and publishes a header on its own. Only the
+// freshening path uses it, where the body is unchanged and there is nothing to
+// pair the header with.
+func (c *cache) storeSerializedHeader(headerData []byte, key string) (int64, bool, error) {
+	e, n, err := c.stageSerializedHeader(headerData, key)
+	if err != nil {
+		c.abandonStaged(e)
+		return n, anyPublished(e), err
+	}
+	if err := c.commitStaged(e); err != nil {
+		c.abandonStaged(e)
+		return n, anyPublished(e), err
+	}
+	return n, true, nil
 }
 
 // Retrieve returns a cached Resource for the given key
@@ -593,6 +766,14 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 	// marker, or starts after cleanup and cannot open the file at all.
 	c.cleanupMu.RLock()
 	defer c.cleanupMu.RUnlock()
+
+	// Hold publication still across both lookups. Opening the body and then
+	// reading the header are two steps, and a commit landing between them
+	// would hand back one version's payload with the other's status and
+	// headers -- a Content-Length or Content-Encoding from a body that is no
+	// longer there.
+	c.publishMu.RLock()
+	defer c.publishMu.RUnlock()
 
 	hashedKey := hashKey(key)
 	bodyPath := bodyPrefix + formatPrefix + hashedKey
