@@ -396,6 +396,24 @@ func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 
 	h, storedAt, err := readStoredHeaders(bufio.NewReader(f))
 	if err != nil {
+		// The header file is this entry's commit marker: Store writes the body
+		// in full first and the header last, so a reader that finds a complete
+		// header knows the body behind it is complete too.
+		//
+		// vfsWrite opens with O_CREATE|O_TRUNC, which publishes an empty file
+		// before any bytes are copied into it. A concurrent Retrieve landing in
+		// that window opens the body (already written), then reads a header
+		// that is empty or cut short. That is not corruption, it is an entry
+		// that is not committed yet, and it is indistinguishable to a reader
+		// from one that was never stored -- so report the miss that callers
+		// already handle instead of a hard error.
+		//
+		// Reporting an error here surfaced as a 502/500 to the client for a
+		// perfectly cacheable resource whenever two requests for the same
+		// uncached URL overlapped, which is the common case for a shared cache.
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return Header{}, time.Time{}, ErrNotFoundInCache
+		}
 		return Header{}, time.Time{}, fmt.Errorf("failed to read headers from %q for key %q: %w", path, key, err)
 	}
 
