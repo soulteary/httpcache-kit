@@ -320,6 +320,34 @@ func (c *cache) scanDirectory(dir string, callback func(hashedKey string, info o
 // truncated or partially replaced the target. Callers updating an existing
 // cache entry use that bit to discard stale metadata after delayed copy/close
 // failures without deleting a still-intact entry after a pre-open failure.
+// publishWrite puts new contents at path.
+//
+// On a disk-backed cache it publishes them atomically, so a concurrent reader
+// sees either the previous file or the complete new one. The in-place write
+// below cannot offer that: O_CREATE|O_TRUNC makes an empty file visible before
+// any bytes are copied into it, which on a first store exposes a window where
+// the entry looks present but unreadable, and on a re-store destroys a
+// perfectly good entry for the duration of the write.
+//
+// The VFS interface has no rename, so other backends keep the in-place write.
+// readHeaderFile's terminator check still turns that window into a miss there.
+//
+// Reported "modified" stays false when the atomic path fails: the target is
+// untouched, so callers must not discard the entry that is still there.
+func (c *cache) publishWrite(path string, r io.Reader) (int64, bool, error) {
+	if c.diskRoot == "" {
+		return c.vfsWrite(path, r)
+	}
+	if err := vfs.MkdirAll(c.fs, pathutil.Dir(path), 0700); err != nil {
+		return 0, false, fmt.Errorf("failed to create cache directory for %q: %w", path, err)
+	}
+	n, err := atomicPublishFile(filepath.Join(c.diskRoot, filepath.FromSlash(path)), r)
+	if err != nil {
+		return n, false, err
+	}
+	return n, true, nil
+}
+
 func (c *cache) vfsWrite(path string, r io.Reader) (int64, bool, error) {
 	if err := vfs.MkdirAll(c.fs, pathutil.Dir(path), 0700); err != nil {
 		return 0, false, fmt.Errorf("failed to create cache directory for %q: %w", path, err)
@@ -340,9 +368,28 @@ func (c *cache) vfsWrite(path string, r io.Reader) (int64, bool, error) {
 }
 
 // atomicWriteFile writes a complete sibling temporary file before replacing
-// path. A failed copy, sync, or close therefore leaves the last valid target
-// untouched; os.Rename makes the final same-filesystem replacement atomic.
+// path, and fsyncs it first. A failed copy, sync, or close therefore leaves
+// the last valid target untouched; os.Rename makes the final same-filesystem
+// replacement atomic.
+//
+// Use this where the contents must survive a crash. Cache entries do not:
+// losing one is a miss, so they take atomicPublishFile instead and skip the
+// fsync, which costs several times the write itself.
 func atomicWriteFile(path string, r io.Reader) (int64, error) {
+	return writeFileThenRename(path, r, true)
+}
+
+// atomicPublishFile replaces path atomically without fsyncing first.
+//
+// Rename is what makes a reader see either the old file or the whole new one,
+// and that is the only guarantee a cache entry needs. Durability across a
+// crash is not worth its price here: fsync per entry measured ~9x on small
+// writes and ~3x on large ones, and an entry lost to a crash is just a miss.
+func atomicPublishFile(path string, r io.Reader) (int64, error) {
+	return writeFileThenRename(path, r, false)
+}
+
+func writeFileThenRename(path string, r io.Reader, sync bool) (int64, error) {
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
@@ -361,8 +408,10 @@ func atomicWriteFile(path string, r io.Reader) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to write temporary cache file for %q: %w", path, err)
 	}
-	if err := f.Sync(); err != nil {
-		return 0, fmt.Errorf("failed to sync temporary cache file for %q: %w", path, err)
+	if sync {
+		if err := f.Sync(); err != nil {
+			return 0, fmt.Errorf("failed to sync temporary cache file for %q: %w", path, err)
+		}
 	}
 	closeErr := f.Close()
 	closed = true
@@ -552,7 +601,7 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 }
 
 func (c *cache) storeBody(r io.Reader, key string) (int64, bool, error) {
-	n, modified, err := c.vfsWrite(bodyPrefix+formatPrefix+hashKey(key), r)
+	n, modified, err := c.publishWrite(bodyPrefix+formatPrefix+hashKey(key), r)
 	if err != nil {
 		return n, modified, fmt.Errorf("failed to store body for key %q: %w", key, err)
 	}
@@ -578,7 +627,7 @@ func serializeStoredHeader(code int, h http.Header, storedAt time.Time) ([]byte,
 }
 
 func (c *cache) storeSerializedHeader(headerData []byte, key string) (int64, bool, error) {
-	n, modified, err := c.vfsWrite(headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(headerData))
+	n, modified, err := c.publishWrite(headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(headerData))
 	if err != nil {
 		return n, modified, fmt.Errorf("failed to store header for key %q: %w", key, err)
 	}
