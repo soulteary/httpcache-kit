@@ -158,6 +158,35 @@ log.Printf("removed %d items (%d bytes, %d stale markers) in %s",
 `Retrieve` returns `ErrNotFoundInCache` for a miss — match it with `errors.Is`.
 A `*Resource` it returns owns a file handle on the disk backend, so close it.
 
+### On-disk layout
+
+The disk backend keeps four things under its directory:
+
+```
+body/v1/<hashed-key>      response body
+header/v1/<hashed-key>    status line, headers, and the store timestamp
+staging/v1/               entries being written, empty when idle
+stale-markers.json        invalidation state
+```
+
+An entry is its body plus its header, and the two are published together by
+rename, so a reader sees the whole previous entry or the whole new one. That
+holds **between goroutines sharing one live cache**, and no further:
+
+- The two renames are sequential. A process that exits between them leaves the
+  new body beside the old header, and startup removes the leftover staging file
+  rather than repairing the pair.
+- The lock is per-instance. Two caches opened on one directory do not
+  coordinate, and their publications can interleave.
+
+Nothing under `staging/v1` is a cache entry: it is never scanned, and whatever
+an interrupted process left there is removed at startup.
+
+Only `body/v1` and `header/v1` count toward `MaxSize` and `Stats().TotalSize`.
+The other `Stats()` fields are independent of these directories —
+`StaleCount` tracks `stale-markers.json`, and `HitCount`/`MissCount` are
+counters.
+
 ## Configuration
 
 ```go
@@ -325,6 +354,46 @@ background writes, for tests that need to wait on all of them.
 
 - Conditional requests carrying `Range` are not cached.
 - `Clock` is a package-level variable, swappable in tests.
+
+## Upgrade Notes (v2.5.0)
+
+No API was added, removed or changed. The disk backend writes entries
+differently, and there is a new directory inside the cache directory.
+
+- **Entries are published by rename on the disk backend.** The previous write
+  opened the target with `O_CREATE|O_TRUNC`, so new contents were never visible
+  as a unit: on a first store an empty file appeared before any bytes reached
+  it, and on a re-store a perfectly readable entry was emptied for as long as
+  the copy took. Replacing a 128 KiB entry under eight concurrent readers
+  produced 2 misses and 258 reads that saw neither the old nor the new body in
+  full; a watcher caught the header file empty 4543 times across 200 re-stores.
+  A reader sharing the cache now sees the whole previous entry or the whole new
+  one — see the on-disk layout section for the two limits on that, a crash
+  between the two renames and two instances on one directory.
+- **A body and its header change together.** `Retrieve` opens the body first and
+  reads the header second, so a publish landing between those two steps used to
+  hand back one version's payload with the other's status and headers — a
+  `Content-Length` or `Content-Encoding` describing a body that was no longer
+  there. Under load, 148 of 600 retrievals mismatched. Both files are now
+  renamed under one lock that `Retrieve` holds across both lookups.
+- **`staging/v1` is new inside the cache directory.** Entries are written there
+  before being renamed into place. It is outside everything that is scanned, so
+  nothing in it is ever mistaken for an entry, and it is swept at startup — a
+  process killed mid-write leaves a file behind that nothing else would reclaim.
+  **If you size, back up or rsync the cache directory, include it**; it is empty
+  when the cache is idle.
+- **Storing costs more, mostly on small entries.** Measured per store against
+  v2.4.0: 4 KiB went 193µs → 967µs, 2 MiB went 1.66ms → 2.03ms. Large entries
+  are close to free; the small-entry cost is the extra syscalls against a very
+  short write. Numbers are from a container filesystem and will differ
+  elsewhere.
+- **Entry files are not fsynced.** Rename is what makes publication atomic;
+  durability across a crash is not what a cache needs, and an entry lost that
+  way is a miss. `stale-markers.json` is still fsynced, because losing
+  invalidation state would republish superseded content.
+- **Memory and other VFS backends are unchanged.** The `VFS` interface has no
+  rename, so they keep the in-place write. The header-completeness check added
+  in v2.4.0 still turns that window into a miss for them.
 
 ## Upgrade Notes (v2.2.0)
 
