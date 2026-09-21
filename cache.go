@@ -1376,9 +1376,7 @@ func (c *cache) evictIfNeeded(hashedKey string, itemSize int64) error {
 		}
 
 		// Record eviction metric
-		if getDefaultMetrics() != nil {
-			getDefaultMetrics().RecordCacheEviction("lru")
-		}
+		getDefaultMetrics().RecordCacheEviction("lru")
 		elem = prev
 	}
 
@@ -1446,13 +1444,9 @@ func (c *cache) Cleanup() CleanupResult {
 
 	result.Duration = Clock().Sub(start)
 
-	// Record cleanup duration metric
-	if getDefaultMetrics() != nil {
-		getDefaultMetrics().RecordCleanupDuration(result.Duration.Seconds())
-		// Update cache stats metrics
-		stats := c.Stats()
-		getDefaultMetrics().UpdateCacheStats(stats)
-	}
+	// Record cleanup duration and refresh the gauges from a fresh snapshot.
+	getDefaultMetrics().RecordCleanupDuration(result.Duration.Seconds())
+	getDefaultMetrics().UpdateCacheStats(c.Stats())
 
 	return result
 }
@@ -1539,9 +1533,7 @@ func (c *cache) cleanupTTLExpired(now time.Time) (int, int64, bool) {
 				removed++
 
 				// Record eviction metric
-				if getDefaultMetrics() != nil {
-					getDefaultMetrics().RecordCacheEviction("ttl")
-				}
+				getDefaultMetrics().RecordCacheEviction("ttl")
 			}
 		}
 
@@ -1575,9 +1567,7 @@ func (c *cache) enforceMaxSize() (int, int64) {
 		removed++
 
 		// Record eviction metric
-		if getDefaultMetrics() != nil {
-			getDefaultMetrics().RecordCacheEviction("size_limit")
-		}
+		getDefaultMetrics().RecordCacheEviction("size_limit")
 		elem = prev
 	}
 

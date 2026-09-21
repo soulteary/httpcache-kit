@@ -1,4 +1,4 @@
-package httpcache
+package prometheusmetrics
 
 import (
 	"testing"
@@ -18,12 +18,12 @@ import (
 func TestNewCacheMetricsTwiceOnOneRegistry(t *testing.T) {
 	reg := metrics.NewRegistry("httpcache_shared_registry_test")
 
-	first := NewCacheMetrics(reg)
+	first := New(reg)
 	if first == nil {
 		t.Fatal("NewCacheMetrics returned nil")
 	}
 
-	second := NewCacheMetrics(reg)
+	second := New(reg)
 	if second == nil {
 		t.Fatal("second NewCacheMetrics returned nil")
 	}

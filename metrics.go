@@ -2,245 +2,103 @@ package httpcache
 
 import (
 	"sync/atomic"
-
-	"github.com/prometheus/client_golang/prometheus"
-	metrics "github.com/soulteary/metrics-kit/v3"
 )
 
-// CacheMetrics holds Prometheus metrics for cache operations
-type CacheMetrics struct {
-	// CacheHits tracks the number of cache hits
-	CacheHits *prometheus.CounterVec
-
-	// CacheMisses tracks the number of cache misses
-	CacheMisses *prometheus.CounterVec
-
-	// CacheSkips tracks the number of cache skips (non-cacheable requests)
-	CacheSkips prometheus.Counter
-
-	// UpstreamDuration tracks the duration of upstream requests
-	UpstreamDuration *prometheus.HistogramVec
-
-	// CacheSizeBytes tracks the current cache size in bytes (gauge)
-	CacheSizeBytes prometheus.Gauge
-
-	// CacheItemCount tracks the current number of cached items (gauge)
-	CacheItemCount prometheus.Gauge
-
-	// CacheStaleCount tracks the current number of stale map entries (gauge)
-	CacheStaleCount prometheus.Gauge
-
-	// UpstreamErrors tracks the number of upstream errors
-	UpstreamErrors *prometheus.CounterVec
-
-	// CacheStoreOperations tracks cache store operations
-	CacheStoreOperations *prometheus.CounterVec
-
-	// CacheRetrieveOperations tracks cache retrieve operations
-	CacheRetrieveOperations *prometheus.CounterVec
-
-	// CacheEvictions tracks the number of cache evictions
-	CacheEvictions *prometheus.CounterVec
-
-	// CacheCleanupDuration tracks the duration of cleanup operations
-	CacheCleanupDuration prometheus.Histogram
+// Metrics is what the cache records through. It is an interface, and the root
+// package deliberately provides no implementation that talks to a metrics
+// backend: the Prometheus one lives in the prometheusmetrics subpackage, so a
+// service that does not export metrics never links Prometheus.
+//
+// Implement it yourself to record into something else -- OpenTelemetry, statsd,
+// a test double, an expvar map. Embed [NopMetrics] to pick up no-op
+// implementations of the methods you do not care about; new methods added in a
+// future minor release will then not break your type.
+type Metrics interface {
+	// RecordCacheHit records a cache hit for an HTTP method.
+	RecordCacheHit(method string)
+	// RecordCacheMiss records a cache miss for an HTTP method.
+	RecordCacheMiss(method string)
+	// RecordCacheSkip records a request that was not cacheable at all.
+	RecordCacheSkip()
+	// RecordUpstreamDuration records how long an upstream request took.
+	RecordUpstreamDuration(method string, status int, durationSeconds float64)
+	// RecordUpstreamError records an upstream failure by kind.
+	RecordUpstreamError(errorType string)
+	// RecordStoreOperation records an attempt to write an entry to the cache.
+	RecordStoreOperation(success bool)
+	// RecordRetrieveOperation records an attempt to read an entry from the cache.
+	RecordRetrieveOperation(found bool)
+	// SetCacheSize sets the current total size of cached bodies in bytes.
+	SetCacheSize(sizeBytes int64)
+	// SetCacheItemCount sets the current number of cached items.
+	SetCacheItemCount(count int)
+	// SetCacheStaleCount sets the current number of stale map entries.
+	SetCacheStaleCount(count int)
+	// RecordCacheEviction records one eviction, labelled by why it happened.
+	RecordCacheEviction(reason string)
+	// RecordCleanupDuration records how long a cleanup pass took.
+	RecordCleanupDuration(durationSeconds float64)
+	// UpdateCacheStats sets every gauge from a stats snapshot.
+	UpdateCacheStats(stats CacheStats)
 }
 
-// defaultMetrics holds the default metrics instance (nil until initialized).
-// Accessed via getDefaultMetrics/SetDefaultMetrics to avoid data races.
-// Wrapped in a struct because atomic.Value.Store(nil) panics.
+// NopMetrics discards everything recorded through it. It is the default, so
+// the cache never has to test for a missing recorder before recording -- and
+// so no call site can panic on a nil one.
+type NopMetrics struct{}
+
+// Compile-time proof that the no-op really does satisfy the interface, which
+// is what makes it safe as the default.
+var _ Metrics = NopMetrics{}
+
+func (NopMetrics) RecordCacheHit(string)                       {}
+func (NopMetrics) RecordCacheMiss(string)                      {}
+func (NopMetrics) RecordCacheSkip()                            {}
+func (NopMetrics) RecordUpstreamDuration(string, int, float64) {}
+func (NopMetrics) RecordUpstreamError(string)                  {}
+func (NopMetrics) RecordStoreOperation(bool)                   {}
+func (NopMetrics) RecordRetrieveOperation(bool)                {}
+func (NopMetrics) SetCacheSize(int64)                          {}
+func (NopMetrics) SetCacheItemCount(int)                       {}
+func (NopMetrics) SetCacheStaleCount(int)                      {}
+func (NopMetrics) RecordCacheEviction(string)                  {}
+func (NopMetrics) RecordCleanupDuration(float64)               {}
+func (NopMetrics) UpdateCacheStats(CacheStats)                 {}
+
+// defaultMetrics holds the process-wide recorder. Accessed only through
+// getDefaultMetrics/SetDefaultMetrics to avoid data races; wrapped in a struct
+// because atomic.Value.Store(nil) panics.
 var defaultMetrics atomic.Value
 
-type defaultMetricsHolder struct{ m *CacheMetrics }
+type defaultMetricsHolder struct{ m Metrics }
 
-// getDefaultMetrics returns the current default metrics (nil if not set).
-func getDefaultMetrics() *CacheMetrics {
-	v := defaultMetrics.Load()
-	if v == nil {
-		return nil
+// getDefaultMetrics returns the current recorder, never nil.
+//
+// Returning [NopMetrics] rather than nil is what lets every call site record
+// unconditionally. With an interface, a nil default is not the harmless
+// no-op a nil *CacheMetrics used to be -- calling a method on a nil interface
+// panics -- so "unset" has to be a real object.
+func getDefaultMetrics() Metrics {
+	v, ok := defaultMetrics.Load().(defaultMetricsHolder)
+	if !ok || v.m == nil {
+		return NopMetrics{}
 	}
-	return v.(*defaultMetricsHolder).m
+	return v.m
 }
 
-// GetDefaultMetrics returns the current default metrics instance (nil until initialized).
-func GetDefaultMetrics() *CacheMetrics {
+// GetDefaultMetrics returns the current recorder. It never returns nil: until
+// something calls [SetDefaultMetrics], it is a [NopMetrics].
+func GetDefaultMetrics() Metrics {
 	return getDefaultMetrics()
 }
 
-// SetDefaultMetrics sets the default metrics instance (e.g. for tests).
-func SetDefaultMetrics(m *CacheMetrics) {
-	defaultMetrics.Store(&defaultMetricsHolder{m})
-}
-
-// NewCacheMetrics creates and registers cache metrics with the given registry
-func NewCacheMetrics(registry *metrics.Registry) *CacheMetrics {
-	cacheRegistry := registry.WithSubsystem("cache")
-
-	m := &CacheMetrics{
-		CacheHits: cacheRegistry.Counter("hits_total").
-			Help("Total number of cache hits").
-			Labels("method").
-			BuildVec(),
-
-		CacheMisses: cacheRegistry.Counter("misses_total").
-			Help("Total number of cache misses").
-			Labels("method").
-			BuildVec(),
-
-		CacheSkips: cacheRegistry.Counter("skips_total").
-			Help("Total number of cache skips (non-cacheable requests)").
-			Build(),
-
-		UpstreamDuration: cacheRegistry.Histogram("upstream_request_duration_seconds").
-			Help("Duration of upstream requests in seconds").
-			Labels("method", "status").
-			Buckets(metrics.HTTPDurationBuckets()).
-			BuildVec(),
-
-		CacheSizeBytes: cacheRegistry.Gauge("size_bytes").
-			Help("Current cache size in bytes").
-			Build(),
-
-		CacheItemCount: cacheRegistry.Gauge("item_count").
-			Help("Current number of cached items").
-			Build(),
-
-		CacheStaleCount: cacheRegistry.Gauge("stale_count").
-			Help("Current number of stale map entries").
-			Build(),
-
-		UpstreamErrors: cacheRegistry.Counter("upstream_errors_total").
-			Help("Total number of upstream errors").
-			Labels("error_type").
-			BuildVec(),
-
-		CacheStoreOperations: cacheRegistry.Counter("store_operations_total").
-			Help("Total number of cache store operations").
-			Labels("result").
-			BuildVec(),
-
-		CacheRetrieveOperations: cacheRegistry.Counter("retrieve_operations_total").
-			Help("Total number of cache retrieve operations").
-			Labels("result").
-			BuildVec(),
-
-		CacheEvictions: cacheRegistry.Counter("evictions_total").
-			Help("Total number of cache evictions").
-			Labels("reason").
-			BuildVec(),
-
-		CacheCleanupDuration: cacheRegistry.Histogram("cleanup_duration_seconds").
-			Help("Duration of cache cleanup operations in seconds").
-			Buckets([]float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10}).
-			Build(),
-	}
-
-	SetDefaultMetrics(m)
-	return m
-}
-
-// RecordCacheHit records a cache hit
-func (m *CacheMetrics) RecordCacheHit(method string) {
-	if m != nil && m.CacheHits != nil {
-		m.CacheHits.WithLabelValues(method).Inc()
-	}
-}
-
-// RecordCacheMiss records a cache miss
-func (m *CacheMetrics) RecordCacheMiss(method string) {
-	if m != nil && m.CacheMisses != nil {
-		m.CacheMisses.WithLabelValues(method).Inc()
-	}
-}
-
-// RecordCacheSkip records a cache skip
-func (m *CacheMetrics) RecordCacheSkip() {
-	if m != nil && m.CacheSkips != nil {
-		m.CacheSkips.Inc()
-	}
-}
-
-// RecordUpstreamDuration records the duration of an upstream request
-func (m *CacheMetrics) RecordUpstreamDuration(method string, status int, durationSeconds float64) {
-	if m != nil && m.UpstreamDuration != nil {
-		statusStr := "success"
-		if status >= 400 {
-			statusStr = "error"
-		}
-		m.UpstreamDuration.WithLabelValues(method, statusStr).Observe(durationSeconds)
-	}
-}
-
-// RecordUpstreamError records an upstream error
-func (m *CacheMetrics) RecordUpstreamError(errorType string) {
-	if m != nil && m.UpstreamErrors != nil {
-		m.UpstreamErrors.WithLabelValues(errorType).Inc()
-	}
-}
-
-// RecordStoreOperation records a cache store operation
-func (m *CacheMetrics) RecordStoreOperation(success bool) {
-	if m != nil && m.CacheStoreOperations != nil {
-		result := "success"
-		if !success {
-			result = "failure"
-		}
-		m.CacheStoreOperations.WithLabelValues(result).Inc()
-	}
-}
-
-// RecordRetrieveOperation records a cache retrieve operation
-func (m *CacheMetrics) RecordRetrieveOperation(found bool) {
-	if m != nil && m.CacheRetrieveOperations != nil {
-		result := "hit"
-		if !found {
-			result = "miss"
-		}
-		m.CacheRetrieveOperations.WithLabelValues(result).Inc()
-	}
-}
-
-// SetCacheSize sets the current cache size in bytes
-func (m *CacheMetrics) SetCacheSize(sizeBytes int64) {
-	if m != nil && m.CacheSizeBytes != nil {
-		m.CacheSizeBytes.Set(float64(sizeBytes))
-	}
-}
-
-// SetCacheItemCount sets the current number of cached items
-func (m *CacheMetrics) SetCacheItemCount(count int) {
-	if m != nil && m.CacheItemCount != nil {
-		m.CacheItemCount.Set(float64(count))
-	}
-}
-
-// SetCacheStaleCount sets the current number of stale map entries
-func (m *CacheMetrics) SetCacheStaleCount(count int) {
-	if m != nil && m.CacheStaleCount != nil {
-		m.CacheStaleCount.Set(float64(count))
-	}
-}
-
-// RecordCacheEviction records a cache eviction
-func (m *CacheMetrics) RecordCacheEviction(reason string) {
-	if m != nil && m.CacheEvictions != nil {
-		m.CacheEvictions.WithLabelValues(reason).Inc()
-	}
-}
-
-// RecordCleanupDuration records the duration of a cleanup operation
-func (m *CacheMetrics) RecordCleanupDuration(durationSeconds float64) {
-	if m != nil && m.CacheCleanupDuration != nil {
-		m.CacheCleanupDuration.Observe(durationSeconds)
-	}
-}
-
-// UpdateCacheStats updates all cache gauge metrics from stats
-func (m *CacheMetrics) UpdateCacheStats(stats CacheStats) {
+// SetDefaultMetrics installs the process-wide recorder. Passing nil restores
+// [NopMetrics] rather than arming a nil that would panic on first use.
+//
+// prometheusmetrics.New calls this for you.
+func SetDefaultMetrics(m Metrics) {
 	if m == nil {
-		return
+		m = NopMetrics{}
 	}
-	m.SetCacheSize(stats.TotalSize)
-	m.SetCacheItemCount(stats.ItemCount)
-	m.SetCacheStaleCount(stats.StaleCount)
+	defaultMetrics.Store(defaultMetricsHolder{m: m})
 }
