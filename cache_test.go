@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/soulteary/httpcache-kit/v2"
+	"github.com/soulteary/httpcache-kit/v3"
 )
 
 func TestSaveResource(t *testing.T) {

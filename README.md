@@ -1,6 +1,6 @@
 # httpcache-kit
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/httpcache-kit/v2.svg)](https://pkg.go.dev/github.com/soulteary/httpcache-kit/v2)
+[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/httpcache-kit/v3.svg)](https://pkg.go.dev/github.com/soulteary/httpcache-kit/v3)
 [![Go Report Card](.github/goreportcard.svg)](.github/goreportcard-report.md)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
@@ -28,14 +28,17 @@ Evolved from [lox/httpcache](https://github.com/lox/httpcache) (MIT).
 - **Go 1.27+** (`go.mod` declares `go 1.27.0`)
 - `github.com/prometheus/client_golang` for metrics
 
-The v2 module line uses the Fiber v3-compatible `logger-kit/v2` and
-`metrics-kit/v2` types exposed by the cache API. Applications still on the v1
-kit ecosystem should remain on `github.com/soulteary/httpcache-kit` v1.
+The v3 module line exposes `logger-kit/v3` and `metrics-kit/v3` types through
+the cache API. Those kits keep their framework adapters in subpackages, so
+nothing here links a web framework. Applications written against the
+`logger-kit/v2` or `metrics-kit/v2` types should remain on
+`github.com/soulteary/httpcache-kit/v2`, and applications still on the v1 kit
+ecosystem on `github.com/soulteary/httpcache-kit` v1.
 
 ## Installation
 
 ```bash
-go get github.com/soulteary/httpcache-kit/v2
+go get github.com/soulteary/httpcache-kit/v3
 ```
 
 ## Quick Start
@@ -50,7 +53,7 @@ import (
     "net/http"
     "net/http/httputil"
 
-    httpcache "github.com/soulteary/httpcache-kit/v2"
+    httpcache "github.com/soulteary/httpcache-kit/v3"
 )
 
 func main() {
@@ -260,7 +263,7 @@ response cannot evict another origin's entries.
 ## Metrics
 
 ```go
-import metrics "github.com/soulteary/metrics-kit/v2"
+import metrics "github.com/soulteary/metrics-kit/v3"
 
 registry := metrics.NewRegistry("myproxy")
 m := httpcache.NewCacheMetrics(registry)
@@ -281,7 +284,7 @@ upstream duration and errors.
 ## Logging
 
 ```go
-import logger "github.com/soulteary/logger-kit/v2"
+import logger "github.com/soulteary/logger-kit/v3"
 
 httpcache.SetLogger(myLogger)     // package-level logger
 httpcache.SetDebugLogging(true)   // verbose cache decisions
@@ -354,6 +357,83 @@ background writes, for tests that need to wait on all of them.
 
 - Conditional requests carrying `Range` are not cached.
 - `Clock` is a package-level variable, swappable in tests.
+
+## Upgrade Notes (v3.0.0)
+
+The cache's own API did not change. What changed is the module path — this
+module's and two of its dependencies' — because `logger-kit` and `metrics-kit`
+went to `/v3`, and the cache API hands you their types.
+
+1. **Change the module path.** Every import, in every file:
+
+   ```bash
+   go get github.com/soulteary/httpcache-kit/v3
+   go mod edit -droprequire github.com/soulteary/httpcache-kit/v2
+   ```
+
+   ```diff
+   -httpcache "github.com/soulteary/httpcache-kit/v2"
+   +httpcache "github.com/soulteary/httpcache-kit/v3"
+   ```
+
+   `go get -u` will not do this for you; v2 stays on `v2.5.0`.
+
+2. **Re-point `logger-kit` and `metrics-kit` too, if you name their types.**
+   `SetLogger`, `HandlerOptions.Logger` and `NewCacheMetrics` take
+   `*logger.Logger` and `*metrics.Registry`, and a v2 type does not satisfy a v3
+   parameter — the module path is part of the type's identity. This is the only
+   thing that can fail to compile:
+
+   ```diff
+   -logger "github.com/soulteary/logger-kit/v2"
+   -metrics "github.com/soulteary/metrics-kit/v2"
+   +logger "github.com/soulteary/logger-kit/v3"
+   +metrics "github.com/soulteary/metrics-kit/v3"
+   ```
+
+   Every name this cache uses from them — `logger.Default`, `logger.NewDefault`,
+   `logger.Middleware`, `logger.MiddlewareConfig`, `metrics.NewRegistry`,
+   `metrics.Registry`, `metrics.HTTPDurationBuckets` — kept its signature. If
+   you used a `FiberHandler`, a `NewFiberMiddleware` or a `SkipFuncFiber` field
+   from either kit, those moved to their `fiberadapter` subpackages; see those
+   kits' own v3 notes.
+
+3. **Nothing else.** No name in this package was added, removed or changed. Once
+   the imports compile, you are done.
+
+### What this buys you
+
+Those kits moved their Fiber support into `fiberadapter` subpackages, so their
+root packages no longer link a web framework — and this cache never used Fiber
+in the first place. It was carrying the framework because `logger-kit/v2` and
+`metrics-kit/v2` reached it:
+
+| | v2.5.0 | v3.0.0 |
+| --- | --- | --- |
+| Fiber/fasthttp/compress/msgp packages linked | 39 | **0** |
+| packages the library links | 340 | 280 |
+| modules in the build list | 61 | 51 |
+| `// indirect` lines in `go.mod` | 24 | 12 |
+
+The twelve dropped requirements are `gofiber/fiber/v3`, `gofiber/schema`,
+`gofiber/utils/v2`, `klauspost/compress`, `molecule-man/go-brrr`,
+`philhofer/fwd`, `tinylib/msgp`, `valyala/bytebufferpool`, `valyala/fasthttp`,
+`golang.org/x/crypto`, `golang.org/x/net` and `golang.org/x/text`. Fiber still
+appears in `go list -m all`, because `logger-kit/v3` and `metrics-kit/v3`
+require it for their own `fiberadapter` subpackages — but no package from it is
+compiled into a binary that uses this cache.
+
+If you serve this cache behind Fiber, nothing is lost: you were reaching Fiber
+through your own import, not through this module.
+
+### `vfs-kit` v1.4.0 → v1.4.2
+
+Data-race fixes in the in-memory filesystem, which is what `NewMemoryCache` and
+`NewMemoryCacheWithConfig` run on. The single filesystem-wide mutex became
+per-directory locking, and `File.FileMode` and the compressed-read path now take
+the read lock they were missing. No API of it that this cache uses changed;
+v1.4.2 also adds an exported `ErrRemoveRoot`, which this cache cannot produce —
+it only ever removes individual entry files, never a filesystem root.
 
 ## Upgrade Notes (v2.5.0)
 

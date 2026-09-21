@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	metrics "github.com/soulteary/metrics-kit/v2"
+	metrics "github.com/soulteary/metrics-kit/v3"
 	"github.com/soulteary/vfs-kit"
 )
 

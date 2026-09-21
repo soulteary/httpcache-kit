@@ -3,7 +3,7 @@ package httpcache
 import (
 	"testing"
 
-	metrics "github.com/soulteary/metrics-kit/v2"
+	metrics "github.com/soulteary/metrics-kit/v3"
 )
 
 // Two handlers in one process can share a metrics registry, and each calls
