@@ -15,7 +15,6 @@ import (
 	"time"
 
 	logger "github.com/soulteary/logger-kit/v3"
-	metrics "github.com/soulteary/metrics-kit/v3"
 )
 
 func TestNewHandlerWithOptions_WithLogger(t *testing.T) {
@@ -252,8 +251,7 @@ func TestPassUpstream_NoDate_WithMetrics(t *testing.T) {
 			_ = os.Unsetenv("TMPDIR")
 		}
 	}()
-	reg := metrics.NewRegistry("test_finish_pass_metrics")
-	m := NewCacheMetrics(reg)
+	m := newCountingMetrics()
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(http.StatusOK)

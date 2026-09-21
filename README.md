@@ -20,17 +20,18 @@ Evolved from [lox/httpcache](https://github.com/lox/httpcache) (MIT).
 - **Private and shared profiles**: a shared cache refuses `private` responses and strips `private` headers
 - **Memory, disk and VFS backends**: disk storage goes through [vfs-kit](https://github.com/soulteary/vfs-kit)
 - **Bounded**: configurable TTL, max size, cleanup interval, LRU eviction
-- **Observable**: optional Prometheus metrics via [metrics-kit](https://github.com/soulteary/metrics-kit), debug logging via [logger-kit](https://github.com/soulteary/logger-kit)
+- **Observable, and only if you ask**: Prometheus metrics live in the `prometheusmetrics` subpackage, so importing the root package does not link Prometheus — debug logging via [logger-kit](https://github.com/soulteary/logger-kit)
 - **Graceful shutdown**: background cache writes are tracked and can be awaited
 
 ## Requirements
 
 - **Go 1.27+** (`go.mod` declares `go 1.27.0`)
-- `github.com/prometheus/client_golang` for metrics
+- `github.com/prometheus/client_golang` **only if you import `prometheusmetrics`**
 
-The v3 module line exposes `logger-kit/v3` and `metrics-kit/v3` types through
-the cache API. Those kits keep their framework adapters in subpackages, so
-nothing here links a web framework. Applications written against the
+The root package depends on `logger-kit/v3` and `vfs-kit`. Prometheus and
+`metrics-kit/v3` are reached only through the `prometheusmetrics` subpackage,
+so a service that does not export metrics links neither — 51 fewer packages
+and a 32.5% smaller binary than v3. Applications written against the
 `logger-kit/v2` or `metrics-kit/v2` types should remain on
 `github.com/soulteary/httpcache-kit/v2`, and applications still on the v1 kit
 ecosystem on `github.com/soulteary/httpcache-kit` v1.
@@ -38,7 +39,7 @@ ecosystem on `github.com/soulteary/httpcache-kit` v1.
 ## Installation
 
 ```bash
-go get github.com/soulteary/httpcache-kit/v3
+go get github.com/soulteary/httpcache-kit/v4
 ```
 
 ## Quick Start
@@ -262,14 +263,22 @@ response cannot evict another origin's entries.
 
 ## Metrics
 
+Metrics are opt-in at the *import* level: the root package knows what to
+record, not where to send it. Pull in `prometheusmetrics` and you get
+Prometheus; leave it out and you do not link Prometheus at all.
+
 ```go
-import metrics "github.com/soulteary/metrics-kit/v3"
+import (
+    metrics "github.com/soulteary/metrics-kit/v3"
+
+    "github.com/soulteary/httpcache-kit/v4/prometheusmetrics"
+)
 
 registry := metrics.NewRegistry("myproxy")
-m := httpcache.NewCacheMetrics(registry)
+m := prometheusmetrics.New(registry) // also installs itself as the default
 handler.SetMetrics(m)
 
-// Or register a process-wide default
+// The process-wide default, which every cache and handler reports through
 httpcache.SetDefaultMetrics(m)
 m = httpcache.GetDefaultMetrics()
 
@@ -277,9 +286,26 @@ m = httpcache.GetDefaultMetrics()
 m.UpdateCacheStats(cache.Stats())
 ```
 
-`CacheMetrics` exposes hits, misses, skips, evictions, store and retrieve
-operations, item count, size in bytes, stale count, cleanup duration, and
-upstream duration and errors.
+It exposes hits, misses, skips, evictions, store and retrieve operations,
+item count, size in bytes, stale count, cleanup duration, and upstream
+duration and errors.
+
+To record somewhere else — OpenTelemetry, statsd, a test double — implement
+`httpcache.Metrics`. Embed `httpcache.NopMetrics` to inherit no-ops for the
+methods you do not need, so a method added in a later release cannot break
+your recorder:
+
+```go
+type hitCounter struct {
+    httpcache.NopMetrics
+    hits atomic.Int64
+}
+
+func (c *hitCounter) RecordCacheHit(string) { c.hits.Add(1) }
+```
+
+`GetDefaultMetrics` never returns nil — until something calls
+`SetDefaultMetrics`, it is a `NopMetrics`.
 
 ## Logging
 
@@ -357,6 +383,91 @@ background writes, for tests that need to wait on all of them.
 
 - Conditional requests carrying `Range` are not cached.
 - `Clock` is a package-level variable, swappable in tests.
+
+## Changelog
+
+Release-by-release detail, with the measured numbers behind each claim, lives
+in [CHANGELOG.md](CHANGELOG.md).
+
+## Upgrade Notes (v4.0.0)
+
+**Prometheus moved to the `prometheusmetrics` subpackage**, so the root
+package no longer links it. If your service does not export metrics, the only
+change you make is the import path.
+
+### What this buys you
+
+Measured for a program importing only the root package, built `-trimpath`
+against v3.0.0 and v4.0.0:
+
+| | v3.0.0 | v4.0.0 |
+|---|---|---|
+| binary | 10,789,883 B | 7,284,398 B (**−32.5%**) |
+| linked packages | 281 | 230 (−51) |
+| modules in `go.mod` | 52 | 35 (−17) |
+| lines in `go.sum` | 46 | 36 (−10) |
+| Prometheus/protobuf packages | 41 | **0** |
+
+A program that *does* record metrics pays 0.8% more than on v3, for the
+interface indirection and one extra package. The cost is deferred to the
+services that want it, not removed.
+
+### What you have to change
+
+1. **The import path**, everywhere:
+
+   ```diff
+   -go get github.com/soulteary/httpcache-kit/v3
+   +go get github.com/soulteary/httpcache-kit/v4
+   ```
+
+2. **If you use metrics**, import the subpackage and rename two identifiers:
+
+   | v3 | v4 |
+   |---|---|
+   | `httpcache.CacheMetrics` (struct) | `prometheusmetrics.Metrics` |
+   | `httpcache.NewCacheMetrics(reg)` | `prometheusmetrics.New(reg)` |
+
+   ```diff
+   +import "github.com/soulteary/httpcache-kit/v4/prometheusmetrics"
+
+   -m := httpcache.NewCacheMetrics(registry)
+   +m := prometheusmetrics.New(registry)
+    handler.SetMetrics(m)
+   ```
+
+   `httpcache.Metrics` is now the *interface* the cache records through, not a
+   Prometheus struct. `SetDefaultMetrics`, `GetDefaultMetrics` and
+   `Handler.SetMetrics` keep their names and take it.
+
+   There is no deprecated alias, deliberately: an alias would have to import
+   `prometheus/client_golang`, which relinks it and gives back the whole
+   benefit.
+
+3. **Delete any nil check on `GetDefaultMetrics`.** It used to return a
+   `*CacheMetrics` that was nil until metrics were registered, and nil-receiver
+   methods made that safe. An interface has no such courtesy — a method call on
+   a nil interface panics — so "unset" is now a real object, `NopMetrics`:
+
+   ```diff
+   -if m := httpcache.GetDefaultMetrics(); m != nil {
+   -    m.RecordCacheHit("GET")
+   -}
+   +httpcache.GetDefaultMetrics().RecordCacheHit("GET")
+   ```
+
+   `SetDefaultMetrics(nil)` installs `NopMetrics` rather than arming a nil.
+
+Cache behaviour, the handler, the backends, cache keys, invalidation and the
+recorded metric names, labels and buckets are all unchanged — the Prometheus
+constructors were moved verbatim.
+
+### Why logging was not split the same way
+
+`logger-kit` accounts for 5 of the remaining packages, and the handler logs on
+paths the cache cannot report any other way. A logger is not optional the way
+a metrics exporter is, so splitting it would cost an interface and an import
+for almost nothing.
 
 ## Upgrade Notes (v3.0.0)
 

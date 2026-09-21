@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	metrics "github.com/soulteary/metrics-kit/v3"
 	"github.com/soulteary/vfs-kit"
 )
 
@@ -739,8 +738,8 @@ func TestEvictIfNeeded_RejectsOversizedItem(t *testing.T) {
 func TestEvictIfNeeded_WithMetrics(t *testing.T) {
 	prev := GetDefaultMetrics()
 	defer func() { SetDefaultMetrics(prev) }()
-	reg := metrics.NewRegistry("test_evict_metrics")
-	SetDefaultMetrics(NewCacheMetrics(reg))
+	rec := newCountingMetrics()
+	SetDefaultMetrics(rec)
 	config := DefaultCacheConfig().WithMaxSize(1 << 20).WithCleanupInterval(0)
 	cache := NewMemoryCacheWithConfig(config).(*cache)
 	defer func() { _ = cache.Close() }()
@@ -753,10 +752,16 @@ func TestEvictIfNeeded_WithMetrics(t *testing.T) {
 	if err := cache.Store(res2, "k2"); err != nil {
 		t.Fatal(err)
 	}
-	// Second Store should trigger eviction of k1 (LRU); RecordCacheEviction is called
+	// The second Store evicts k1 as least-recently-used, and that eviction has
+	// to reach the recorder. Asserted rather than logged: the recording call
+	// used to sit behind a getDefaultMetrics() != nil guard, and nothing here
+	// would have noticed if removing that guard had dropped the call.
 	stats := cache.Stats()
 	if stats.ItemCount != 1 {
-		t.Logf("eviction may have run: item count %d", stats.ItemCount)
+		t.Fatalf("Stats().ItemCount = %d, want 1 after the LRU eviction", stats.ItemCount)
+	}
+	if got := rec.evictionCount("lru"); got != 1 {
+		t.Errorf("RecordCacheEviction(\"lru\") called %d times, want 1", got)
 	}
 }
 
@@ -779,8 +784,8 @@ func TestCleanupLoop_TickerFires(t *testing.T) {
 func TestCleanup_WithMetrics(t *testing.T) {
 	prev := GetDefaultMetrics()
 	defer func() { SetDefaultMetrics(prev) }()
-	reg := metrics.NewRegistry("test_cleanup_metrics")
-	SetDefaultMetrics(NewCacheMetrics(reg))
+	rec := newCountingMetrics()
+	SetDefaultMetrics(rec)
 	config := DefaultCacheConfig().WithMaxSize(200).WithCleanupInterval(0)
 	cache := NewMemoryCacheWithConfig(config)
 	defer func() { _ = cache.Close() }()
@@ -791,8 +796,14 @@ func TestCleanup_WithMetrics(t *testing.T) {
 		}
 	}
 	result := cache.Cleanup()
-	if result.RemovedItems == 0 {
-		t.Logf("enforceMaxSize may have run: removed=%d", result.RemovedItems)
+	_ = result
+	// Cleanup always reports its duration and refreshes the gauges, whether or
+	// not it removed anything -- both used to be behind a nil guard.
+	if got := rec.cleanupCount(); got != 1 {
+		t.Errorf("RecordCleanupDuration called %d times, want 1", got)
+	}
+	if got := len(rec.stats); got != 1 {
+		t.Errorf("UpdateCacheStats called %d times, want 1", got)
 	}
 }
 

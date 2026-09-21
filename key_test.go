@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/soulteary/httpcache-kit/v3"
+	"github.com/soulteary/httpcache-kit/v4"
 )
 
 func mustParseUrl(u string) *url.URL {

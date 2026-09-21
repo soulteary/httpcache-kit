@@ -5,7 +5,7 @@ import (
 	"log"
 	"testing"
 
-	"github.com/soulteary/httpcache-kit/v3"
+	"github.com/soulteary/httpcache-kit/v4"
 	logger "github.com/soulteary/logger-kit/v3"
 )
 

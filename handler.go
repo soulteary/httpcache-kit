@@ -78,7 +78,7 @@ type Handler struct {
 	upstream  http.Handler
 	validator *Validator
 	cache     Cache
-	metrics   *CacheMetrics
+	metrics   Metrics
 	log       *logger.Logger
 
 	lifecycleMu sync.Mutex
@@ -154,6 +154,19 @@ func (h *Handler) logRef() *logger.Logger {
 	return cacheLogger
 }
 
+// metricsRef returns the handler's recorder, never nil.
+//
+// Same shape as logRef, and for the same reason: the field can be unset. It
+// matters more here than it used to -- metrics was a *CacheMetrics whose
+// nil-receiver methods were harmless no-ops, while an unset Metrics interface
+// panics on the first record.
+func (h *Handler) metricsRef() Metrics {
+	if h.metrics != nil {
+		return h.metrics
+	}
+	return NopMetrics{}
+}
+
 func (h *Handler) debugf(format string, args ...interface{}) {
 	if IsDebugLogging() {
 		h.logRef().Debug().Msgf(format, args...)
@@ -164,8 +177,14 @@ func (h *Handler) errorf(format string, args ...interface{}) {
 	h.logRef().Error().Msgf(format, args...)
 }
 
-// SetMetrics sets the metrics instance for the handler
-func (h *Handler) SetMetrics(m *CacheMetrics) {
+// SetMetrics sets the recorder for this handler.
+//
+// Passing nil installs [NopMetrics] rather than a nil interface, which
+// would panic the first time the handler recorded anything.
+func (h *Handler) SetMetrics(m Metrics) {
+	if m == nil {
+		m = NopMetrics{}
+	}
 	h.metrics = m
 }
 
@@ -181,7 +200,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		h.debugf("request not cacheable")
 		rw.Header().Set(CacheHeader, "SKIP")
 		if h.metrics != nil {
-			h.metrics.RecordCacheSkip()
+			h.metricsRef().RecordCacheSkip()
 		}
 		h.pipeUpstream(rw, cReq)
 		return
@@ -207,7 +226,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		}
 		h.debugf("%s %s not in %s cache", r.Method, r.URL.String(), cacheType)
 		if h.metrics != nil {
-			h.metrics.RecordCacheMiss(r.Method)
+			h.metricsRef().RecordCacheMiss(r.Method)
 		}
 		flight, leader := h.claimMiss(cReq.Key.String())
 		if leader {
@@ -302,7 +321,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	h.debugf("serving from cache")
 	res.Header().Set(CacheHeader, "HIT")
 	if h.metrics != nil {
-		h.metrics.RecordCacheHit(r.Method)
+		h.metricsRef().RecordCacheHit(r.Method)
 	}
 	h.serveResource(res, rw, cReq)
 
@@ -555,7 +574,7 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest, complete 
 
 	// Record upstream duration metric
 	if h.metrics != nil {
-		h.metrics.RecordUpstreamDuration(r.Method, rw.StatusCode, upstreamDuration.Seconds())
+		h.metricsRef().RecordUpstreamDuration(r.Method, rw.StatusCode, upstreamDuration.Seconds())
 	}
 
 	proxyDate := Clock().Format(http.TimeFormat)
@@ -937,12 +956,12 @@ func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func())
 		if err := h.cache.Store(res, keys...); err != nil {
 			h.errorf("storing resources %#v failed with error: %s", keys, err.Error())
 			if h.metrics != nil {
-				h.metrics.RecordStoreOperation(false)
+				h.metricsRef().RecordStoreOperation(false)
 			}
 		} else {
 			h.recordFresh(r.Time, keys...)
 			if h.metrics != nil {
-				h.metrics.RecordStoreOperation(true)
+				h.metricsRef().RecordStoreOperation(true)
 			}
 		}
 

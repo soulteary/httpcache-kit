@@ -19,16 +19,17 @@ RFC 7234 失效，以及可选的 Prometheus 指标。
 - **私有与共享两种模式**：共享缓存拒绝存储 `private` 响应，并剥掉 `private` 列出的 header
 - **内存、磁盘与 VFS 后端**：磁盘存储经由 [vfs-kit](https://github.com/soulteary/vfs-kit)
 - **有界**：可配置 TTL、最大容量、清理周期、LRU 淘汰
-- **可观测**：通过 [metrics-kit](https://github.com/soulteary/metrics-kit) 暴露 Prometheus 指标，通过 [logger-kit](https://github.com/soulteary/logger-kit) 输出调试日志
+- **可观测，且按需付费**：Prometheus 指标放在 `prometheusmetrics` 子包，导入根包不会链接 Prometheus；调试日志通过 [logger-kit](https://github.com/soulteary/logger-kit) 输出
 - **优雅关闭**：后台缓存写入被跟踪，可以等待其完成
 
 ## 要求
 
 - **Go 1.27+**（`go.mod` 声明 `go 1.27.0`）
-- 指标功能需要 `github.com/prometheus/client_golang`
+- **只有导入 `prometheusmetrics` 时**才需要 `github.com/prometheus/client_golang`
 
-v3 模块线通过缓存 API 暴露 `logger-kit/v3` 与 `metrics-kit/v3` 的类型。这两个 kit
-把框架适配器留在各自的子包里，所以这里不链接任何 Web 框架。代码写的是
+根包只依赖 `logger-kit/v3` 和 `vfs-kit`。Prometheus 和 `metrics-kit/v3` 只能经由
+`prometheusmetrics` 子包到达，所以不暴露指标的服务两个都不会链接 —— 比 v3 少 51
+个包，二进制小 32.5%。代码写的是
 `logger-kit/v2` 或 `metrics-kit/v2` 类型的应用请继续使用
 `github.com/soulteary/httpcache-kit/v2`；仍在 v1 kit 生态上的应用请继续使用
 `github.com/soulteary/httpcache-kit` v1。
@@ -36,7 +37,7 @@ v3 模块线通过缓存 API 暴露 `logger-kit/v3` 与 `metrics-kit/v3` 的类�
 ## 安装
 
 ```bash
-go get github.com/soulteary/httpcache-kit/v3
+go get github.com/soulteary/httpcache-kit/v4
 ```
 
 ## 快速开始
@@ -243,14 +244,21 @@ keyString := key.String()
 
 ## 指标
 
+指标是在 **import 层面**可选的：根包只知道该记录什么，不知道往哪里送。导入
+`prometheusmetrics` 就得到 Prometheus；不导入就完全不链接 Prometheus。
+
 ```go
-import metrics "github.com/soulteary/metrics-kit/v3"
+import (
+    metrics "github.com/soulteary/metrics-kit/v3"
+
+    "github.com/soulteary/httpcache-kit/v4/prometheusmetrics"
+)
 
 registry := metrics.NewRegistry("myproxy")
-m := httpcache.NewCacheMetrics(registry)
+m := prometheusmetrics.New(registry) // 同时把自己装成默认记录器
 handler.SetMetrics(m)
 
-// 或者注册一个进程级默认值
+// 进程级默认值，所有 cache 和 handler 都经由它上报
 httpcache.SetDefaultMetrics(m)
 m = httpcache.GetDefaultMetrics()
 
@@ -258,8 +266,24 @@ m = httpcache.GetDefaultMetrics()
 m.UpdateCacheStats(cache.Stats())
 ```
 
-`CacheMetrics` 暴露命中、未命中、跳过、淘汰、存取操作数、条目数、字节数、陈旧条目数、
+它暴露命中、未命中、跳过、淘汰、存取操作数、条目数、字节数、陈旧条目数、
 清理耗时，以及上游耗时与错误。
+
+要送到别处 —— OpenTelemetry、statsd、测试替身 —— 实现 `httpcache.Metrics` 即可。
+嵌入 `httpcache.NopMetrics` 就能为用不到的方法继承空实现，这样以后版本新增方法
+也不会让你的记录器编译失败：
+
+```go
+type hitCounter struct {
+    httpcache.NopMetrics
+    hits atomic.Int64
+}
+
+func (c *hitCounter) RecordCacheHit(string) { c.hits.Add(1) }
+```
+
+`GetDefaultMetrics` 永远不返回 nil —— 在调用 `SetDefaultMetrics` 之前，它是
+`NopMetrics`。
 
 ## 日志
 
@@ -337,6 +361,82 @@ cache.Close()
 
 - 带 `Range` 的条件请求不会被缓存。
 - `Clock` 是包级变量，测试中可以替换。
+
+## 变更日志
+
+逐版本的详细说明，以及每条结论背后的实测数字，见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 升级说明（v4.0.0）
+
+**Prometheus 挪进了 `prometheusmetrics` 子包**，根包不再链接它。如果你的服务不暴露
+指标，唯一要改的就是 import 路径。
+
+### 这次升级换来了什么
+
+实测一个只导入根包的程序，`-trimpath` 分别对 v3.0.0 和 v4.0.0 构建：
+
+| | v3.0.0 | v4.0.0 |
+|---|---|---|
+| 二进制 | 10,789,883 B | 7,284,398 B（**−32.5%**） |
+| 链接包 | 281 | 230（−51） |
+| `go.mod` 模块 | 52 | 35（−17） |
+| `go.sum` 行数 | 46 | 36（−10） |
+| Prometheus/protobuf 包 | 41 | **0** |
+
+而**确实要记指标**的程序只比 v3 多付 0.8%，来自接口间接调用和多出的一个包。代价是
+转嫁给需要它的服务，而不是凭空消失。
+
+### 你需要改什么
+
+1. **import 路径**，全部：
+
+   ```diff
+   -go get github.com/soulteary/httpcache-kit/v3
+   +go get github.com/soulteary/httpcache-kit/v4
+   ```
+
+2. **如果你用了指标**，导入子包并改两个名字：
+
+   | v3 | v4 |
+   |---|---|
+   | `httpcache.CacheMetrics`（结构体） | `prometheusmetrics.Metrics` |
+   | `httpcache.NewCacheMetrics(reg)` | `prometheusmetrics.New(reg)` |
+
+   ```diff
+   +import "github.com/soulteary/httpcache-kit/v4/prometheusmetrics"
+
+   -m := httpcache.NewCacheMetrics(registry)
+   +m := prometheusmetrics.New(registry)
+    handler.SetMetrics(m)
+   ```
+
+   `httpcache.Metrics` 现在指的是缓存上报所用的**接口**，不再是 Prometheus 结构体。
+   `SetDefaultMetrics`、`GetDefaultMetrics` 和 `Handler.SetMetrics` 名字不变，改为接收它。
+
+   这里刻意没有保留兼容别名：别名必须 import `prometheus/client_golang`，一 import
+   就又把它链回来了，拆分的收益也就没了。
+
+3. **删掉对 `GetDefaultMetrics` 的判空。** 它过去返回 `*CacheMetrics`，在注册指标前
+   是 nil，靠 nil receiver 方法保证安全。接口没有这种待遇 —— 对 nil 接口调方法会
+   panic —— 所以"未设置"现在是一个真实对象 `NopMetrics`：
+
+   ```diff
+   -if m := httpcache.GetDefaultMetrics(); m != nil {
+   -    m.RecordCacheHit("GET")
+   -}
+   +httpcache.GetDefaultMetrics().RecordCacheHit("GET")
+   ```
+
+   `SetDefaultMetrics(nil)` 会装上 `NopMetrics`，而不是埋一个 nil。
+
+缓存行为、handler、后端、缓存键、失效逻辑，以及记录的指标名/标签/分桶全部不变 ——
+Prometheus 构造代码是原样搬过去的。
+
+### 为什么日志没有一起拆
+
+`logger-kit` 只占剩下 230 个包里的 5 个，而 handler 有些路径除了日志没有别的方式
+上报。日志不像指标导出那样是可选的，拆它要付出一个接口加一次 import，换来的却几乎
+没有。
 
 ## 升级说明（v3.0.0）
 
