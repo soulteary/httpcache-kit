@@ -1,6 +1,6 @@
 # httpcache-kit
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/httpcache-kit/v2.svg)](https://pkg.go.dev/github.com/soulteary/httpcache-kit/v2)
+[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/httpcache-kit/v3.svg)](https://pkg.go.dev/github.com/soulteary/httpcache-kit/v3)
 [![Go Report Card](.github/goreportcard.svg)](.github/goreportcard-report.md)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
@@ -27,13 +27,16 @@ RFC 7234 失效，以及可选的 Prometheus 指标。
 - **Go 1.27+**（`go.mod` 声明 `go 1.27.0`）
 - 指标功能需要 `github.com/prometheus/client_golang`
 
-v2 模块线使用缓存 API 暴露出的、兼容 Fiber v3 的 `logger-kit/v2` 与 `metrics-kit/v2`
-类型。仍在 v1 kit 生态上的应用请继续使用 `github.com/soulteary/httpcache-kit` v1。
+v3 模块线通过缓存 API 暴露 `logger-kit/v3` 与 `metrics-kit/v3` 的类型。这两个 kit
+把框架适配器留在各自的子包里，所以这里不链接任何 Web 框架。代码写的是
+`logger-kit/v2` 或 `metrics-kit/v2` 类型的应用请继续使用
+`github.com/soulteary/httpcache-kit/v2`；仍在 v1 kit 生态上的应用请继续使用
+`github.com/soulteary/httpcache-kit` v1。
 
 ## 安装
 
 ```bash
-go get github.com/soulteary/httpcache-kit/v2
+go get github.com/soulteary/httpcache-kit/v3
 ```
 
 ## 快速开始
@@ -48,7 +51,7 @@ import (
     "net/http"
     "net/http/httputil"
 
-    httpcache "github.com/soulteary/httpcache-kit/v2"
+    httpcache "github.com/soulteary/httpcache-kit/v3"
 )
 
 func main() {
@@ -241,7 +244,7 @@ keyString := key.String()
 ## 指标
 
 ```go
-import metrics "github.com/soulteary/metrics-kit/v2"
+import metrics "github.com/soulteary/metrics-kit/v3"
 
 registry := metrics.NewRegistry("myproxy")
 m := httpcache.NewCacheMetrics(registry)
@@ -261,7 +264,7 @@ m.UpdateCacheStats(cache.Stats())
 ## 日志
 
 ```go
-import logger "github.com/soulteary/logger-kit/v2"
+import logger "github.com/soulteary/logger-kit/v3"
 
 httpcache.SetLogger(myLogger)     // 包级 logger
 httpcache.SetDebugLogging(true)   // 详细打印缓存决策
@@ -334,6 +337,76 @@ cache.Close()
 
 - 带 `Range` 的条件请求不会被缓存。
 - `Clock` 是包级变量，测试中可以替换。
+
+## 升级说明（v3.0.0）
+
+缓存自身的 API 没有任何变化。变的是模块路径 —— 本模块的，以及它两个依赖的 ——
+因为 `logger-kit` 和 `metrics-kit` 升到了 `/v3`，而缓存 API 会把它们的类型交给你。
+
+1. **改模块路径。** 每个文件里的每处 import：
+
+   ```bash
+   go get github.com/soulteary/httpcache-kit/v3
+   go mod edit -droprequire github.com/soulteary/httpcache-kit/v2
+   ```
+
+   ```diff
+   -httpcache "github.com/soulteary/httpcache-kit/v2"
+   +httpcache "github.com/soulteary/httpcache-kit/v3"
+   ```
+
+   `go get -u` 不会帮你做这件事；v2 停留在 `v2.5.0`。
+
+2. **如果你的代码写到了它们的类型，`logger-kit` 与 `metrics-kit` 也要一起改。**
+   `SetLogger`、`HandlerOptions.Logger` 和 `NewCacheMetrics` 接收
+   `*logger.Logger` 与 `*metrics.Registry`，而 v2 的类型无法满足 v3 的参数 ——
+   模块路径是类型标识的一部分。这是唯一可能编译不过的地方：
+
+   ```diff
+   -logger "github.com/soulteary/logger-kit/v2"
+   -metrics "github.com/soulteary/metrics-kit/v2"
+   +logger "github.com/soulteary/logger-kit/v3"
+   +metrics "github.com/soulteary/metrics-kit/v3"
+   ```
+
+   本缓存用到的每个名字 —— `logger.Default`、`logger.NewDefault`、
+   `logger.Middleware`、`logger.MiddlewareConfig`、`metrics.NewRegistry`、
+   `metrics.Registry`、`metrics.HTTPDurationBuckets` —— 签名都没变。如果你用过这
+   两个 kit 里的 `FiberHandler`、`NewFiberMiddleware` 或 `SkipFuncFiber` 字段，
+   它们已移入各自的 `fiberadapter` 子包，详见那两个 kit 自己的 v3 升级说明。
+
+3. **没有别的了。** 本包没有新增、删除或修改任何名字。import 能编译过，就升级完了。
+
+### 这次升级换来了什么
+
+这两个 kit 把 Fiber 支持移进了 `fiberadapter` 子包，根包不再链接任何 Web 框架 ——
+而本缓存从来就没用过 Fiber。它之前一直背着这个框架，只是因为 `logger-kit/v2` 和
+`metrics-kit/v2` 把它带了进来：
+
+| | v2.5.0 | v3.0.0 |
+| --- | --- | --- |
+| 链接的 Fiber/fasthttp/compress/msgp 包数 | 39 | **0** |
+| 库链接的包总数 | 340 | 280 |
+| build list 中的模块数 | 61 | 51 |
+| `go.mod` 里的 `// indirect` 行数 | 24 | 12 |
+
+减掉的十二项依赖是 `gofiber/fiber/v3`、`gofiber/schema`、`gofiber/utils/v2`、
+`klauspost/compress`、`molecule-man/go-brrr`、`philhofer/fwd`、`tinylib/msgp`、
+`valyala/bytebufferpool`、`valyala/fasthttp`、`golang.org/x/crypto`、
+`golang.org/x/net` 和 `golang.org/x/text`。Fiber 仍会出现在 `go list -m all`
+里，因为 `logger-kit/v3` 和 `metrics-kit/v3` 为自己的 `fiberadapter` 子包 require
+了它 —— 但它的任何包都不会被编译进使用本缓存的二进制。
+
+如果你本来就把这个缓存跑在 Fiber 后面，什么也没丢：你的 Fiber 是从自己的 import
+来的，不是从本模块来的。
+
+### `vfs-kit` v1.4.0 → v1.4.2
+
+修复了内存文件系统的数据竞争 —— 也就是 `NewMemoryCache` 和
+`NewMemoryCacheWithConfig` 运行其上的那个实现。原来整个文件系统共用一把互斥锁，
+现在改为按目录加锁；`File.FileMode` 和压缩读取路径也补上了原本缺失的读锁。本缓存
+用到的 API 没有变化；v1.4.2 还新导出了一个 `ErrRemoveRoot`，而本缓存不可能产生它
+—— 它只会删除单个条目文件，从不删除文件系统根。
 
 ## 升级说明（v2.5.0）
 
