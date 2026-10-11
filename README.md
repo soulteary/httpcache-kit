@@ -25,7 +25,7 @@ Evolved from [lox/httpcache](https://github.com/lox/httpcache) (MIT).
 
 ## Requirements
 
-- **Go 1.27+** (`go.mod` declares `go 1.27.0`)
+- **Go 1.27+** (`go.mod` declares `go 1.27.2`)
 - `github.com/prometheus/client_golang` **only if you import `prometheusmetrics`**
 
 The root package depends on `logger-kit/v3` and `vfs-kit`. Prometheus and
