@@ -94,6 +94,8 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v6
 
+      with:
+        persist-credentials: false
     - name: Set up Go environment
       uses: actions/setup-go@v6
       with:
@@ -161,7 +163,7 @@ jobs:
         import subprocess
         import sys
         import tempfile
-        
+
         # Validate the exact invocation that creates the published files.
         directory = sys.argv[1] if len(sys.argv) > 1 else "."
         output = pathlib.Path(".github") if directory == "." else pathlib.Path(".github/reports") / directory
@@ -226,6 +228,8 @@ jobs:
   # The whole point of the v4 split: importing the root package must not link
   # Prometheus. A stray import would restore it silently and no other check
   # would notice, so the release asserts it.
+    permissions:
+      contents: read
   layering:
     name: Root Package Must Not Link Prometheus
     runs-on: ubuntu-latest
