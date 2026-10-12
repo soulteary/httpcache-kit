@@ -52,7 +52,7 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 		}
 		return applyValidationResponse(req.Request, res, exchange.status, exchange.snapshot, start), false
 	}
-	h.passUpstreamWithHandler(w, req, nil, http.HandlerFunc(func(dst http.ResponseWriter, _ *http.Request) {
+	h.passUpstreamWithHandler(newClientPreconditionWriter(w, req.Request), req, nil, http.HandlerFunc(func(dst http.ResponseWriter, _ *http.Request) {
 		for name, values := range exchange.snapshot {
 			dst.Header()[name] = append([]string(nil), values...)
 		}

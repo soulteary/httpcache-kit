@@ -40,7 +40,8 @@ type Resource struct {
 	stale                     bool
 	// storedAt is when THIS cache wrote the entry, at full precision. Zero
 	// for a resource that did not come out of a cache.
-	storedAt time.Time
+	storedAt  time.Time
+	storedKey string // exact entry generation retrieved, excluding a Vary discovery base
 }
 
 func NewResource(statusCode int, body ReadSeekCloser, hdrs http.Header) *Resource {

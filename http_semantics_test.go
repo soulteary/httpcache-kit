@@ -119,3 +119,92 @@ func TestExpiresLifetimeUsesOriginDateOnce(t *testing.T) {
 		t.Fatal("invalid explicit Expires used heuristic freshness")
 	}
 }
+
+func TestConditionalFullResponseHonorsOriginalClientValidator(t *testing.T) {
+	for _, condition := range []string{"etag", "date"} {
+		t.Run(condition, func(t *testing.T) {
+			var calls atomic.Int64
+			cache := NewMemoryCache().(ExtendedCache)
+			defer func() { _ = cache.Close() }()
+			modified := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+			h := NewSharedHandler(cache, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				n := calls.Add(1)
+				w.Header().Set("Cache-Control", "max-age=3600")
+				if n == 1 {
+					w.Header().Set("ETag", `"v1"`)
+					_, _ = io.WriteString(w, "old")
+					return
+				}
+				if n != 2 || r.Header.Get("If-None-Match") != `"v1"` {
+					t.Error("unexpected validation request")
+				}
+				w.Header().Set("ETag", `"v2"`)
+				w.Header().Set("Last-Modified", modified.Format(http.TimeFormat))
+				w.Header().Set("Content-Length", "3")
+				_, _ = io.WriteString(w, "new")
+			}))
+			defer h.writes.Wait()
+			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "http://cache.example/index", nil))
+			h.writes.Wait()
+			req := httptest.NewRequest("GET", "http://cache.example/index", nil)
+			req.Header.Set("Cache-Control", "min-fresh=7200")
+			if condition == "etag" {
+				req.Header.Set("If-None-Match", `W/"other", W/"v2"`)
+			} else {
+				req.Header.Set("If-Modified-Since", modified.Format(http.TimeFormat))
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			h.writes.Wait()
+			if w.Code != 304 || w.Body.Len() != 0 || calls.Load() != 2 || w.Header().Get("Content-Length") != "" {
+				t.Fatalf("wrong client response: %d %q %+v calls=%d", w.Code, w.Body.String(), w.Header(), calls.Load())
+			}
+			w = httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest("GET", "http://cache.example/index", nil))
+			if w.Code != 200 || w.Body.String() != "new" || calls.Load() != 2 {
+				t.Fatal("new full representation was not cached")
+			}
+		})
+	}
+}
+
+func TestVaryValidationDoesNotFreshenAnotherBaseGeneration(t *testing.T) {
+	var calls atomic.Int64
+	cache := NewMemoryCache().(ExtendedCache)
+	defer func() { _ = cache.Close() }()
+	h := NewSharedHandler(cache, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		language := r.Header.Get("Accept-Language")
+		w.Header().Set("Vary", "Accept-Language")
+		w.Header().Set("ETag", `"`+language+`"`)
+		w.Header().Set("Cache-Control", "max-age=3600")
+		if r.Header.Get("If-None-Match") == `"`+language+`"` {
+			w.WriteHeader(304)
+			return
+		}
+		_, _ = io.WriteString(w, language)
+	}))
+	defer h.writes.Wait()
+	get := func(language string, force bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("GET", "http://cache.example/index", nil)
+		req.Header.Set("Accept-Language", language)
+		if force {
+			req.Header.Set("Cache-Control", "min-fresh=7200")
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		h.writes.Wait()
+		return w
+	}
+	get("en", false)
+	get("fr", false)
+	for _, force := range []bool{true, false} {
+		w := get("en", force)
+		if w.Code != 200 || w.Body.String() != "en" || calls.Load() != 3 {
+			t.Fatalf("validated variant was refetched: %d %q calls=%d", w.Code, w.Body.String(), calls.Load())
+		}
+	}
+	if w := get("fr", false); w.Code != 200 || w.Body.String() != "fr" || calls.Load() != 3 {
+		t.Fatal("newer base variant was modified")
+	}
+}

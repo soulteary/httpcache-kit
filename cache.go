@@ -853,6 +853,7 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 		persistedAt = c.entryStoredAt(hashedKey)
 	}
 	res.SetStoredAt(persistedAt)
+	res.storedKey = key
 
 	// Check stale map with proper locking
 	c.staleMutex.RLock()
@@ -1122,6 +1123,12 @@ func (c *cache) Freshen(res *Resource, keys ...string) error {
 		}
 
 		for _, key := range keys {
+			// A Vary base describes how to find variants; its body can belong to
+			// another request. Freshen only the retrieved generation, while the
+			// invalidation checks above still include every governing key.
+			if res.storedKey != "" && key != res.storedKey {
+				continue
+			}
 			mismatch, err := c.freshenResourceForKey(res, key)
 			if err != nil {
 				return err
