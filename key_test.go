@@ -3,6 +3,7 @@ package httpcache_test
 import (
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -133,5 +134,55 @@ func TestRequestKeyWithInvalidContentLocation(t *testing.T) {
 	// Should not panic; key should be based on original URL
 	if k.String() == "" {
 		t.Fatal("key should not be empty")
+	}
+}
+
+func TestVaryKeyNamespaceDoesNotOverlapLegacyValues(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		legacy string
+		values []string
+	}{
+		{"single-field", `["en"]`, []string{"en"}},
+		{"multiple-fields", `["en","fr"]`, []string{"en", "fr"}},
+		{"empty-field", `[""]`, []string{""}},
+		{"missing-field", "missing", nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			legacyRequest := newRequest("GET", "http://cache.example/variant")
+			legacyRequest.Header.Set("X-Variant", test.legacy)
+			request := newRequest("GET", "http://cache.example/variant")
+			if test.values != nil {
+				request.Header["X-Variant"] = test.values
+			}
+			base := httpcache.NewRequestKey(legacyRequest)
+			legacyKey := base.String() + "\x1f" + strconv.Quote("X-Variant="+legacyRequest.Header.Get("X-Variant"))
+			key := httpcache.NewRequestKey(request).Vary("X-Variant", request).String()
+			if key == legacyKey {
+				t.Fatalf("new variant aliases a legacy field value: %q", key)
+			}
+		})
+	}
+}
+
+func TestVaryKeyNamespacePreservesMethodsAndBaseKeys(t *testing.T) {
+	request := newRequest("GET", "http://cache.example/variant", "X-Variant: en")
+	base := httpcache.NewRequestKey(request)
+	varied := base.Vary("X-Variant", request)
+	head := varied.ForMethod(http.MethodHead)
+	if base.String() != "GET:http://cache.example/variant" || base.ForMethod(http.MethodHead).String() != "HEAD:http://cache.example/variant" {
+		t.Fatal("Vary versioning changed a base key")
+	}
+	if varied.String() == head.String() || head.ForMethod(http.MethodGet).String() != varied.String() {
+		t.Fatal("ForMethod lost method separation or changed the original variant")
+	}
+	for _, method := range []string{http.MethodGet, http.MethodHead, "CUSTOM!"} {
+		key := varied.ForMethod(method).String()
+		if len(key) == 0 || key[0] != '\x1f' {
+			t.Fatalf("variant namespace must begin outside the legal HTTP method alphabet: %q", key)
+		}
+		if strings.HasPrefix(key, method+":") {
+			t.Fatalf("variant shares a legacy method prefix: %q", key)
+		}
 	}
 }

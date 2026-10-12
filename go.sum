@@ -30,8 +30,8 @@ github.com/soulteary/logger-kit/v3 v3.0.2 h1:HB8RoKNT+5PovgNeuSJYAGUA0TOj0eATSqe
 github.com/soulteary/logger-kit/v3 v3.0.2/go.mod h1:w4IYfsZIWb/XzXkguMMqbzUc7n2Am0S5BwHw23/8FxE=
 github.com/soulteary/metrics-kit/v3 v3.0.2 h1:LIbMcUGqKbpQlTerzDsuBlejC9+zEoQH+iXFXkpnaWw=
 github.com/soulteary/metrics-kit/v3 v3.0.2/go.mod h1:mirSDxPeaUUM8JIu1OFOGnpkX5JCq1bm4qV3GrsREeA=
-github.com/soulteary/vfs-kit v1.4.5-0.20261012210923-af6413b52e5b h1:j2PiZsZ9bQlKN/LzUDuhxm15wytvWT3KQMc0zpBs5Gc=
-github.com/soulteary/vfs-kit v1.4.5-0.20261012210923-af6413b52e5b/go.mod h1:fuTQLNKppXGMTycLyCvBuHG/UDJ65MxZRzQYquAwnM8=
+github.com/soulteary/vfs-kit v1.4.5 h1:8WRZ/z0iBw2V/7yivY6ZQq2eV64vdNAfhUcyTKUFnf4=
+github.com/soulteary/vfs-kit v1.4.5/go.mod h1:fuTQLNKppXGMTycLyCvBuHG/UDJ65MxZRzQYquAwnM8=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
 go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
