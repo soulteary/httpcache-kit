@@ -130,6 +130,11 @@ func TestCacheFreshenAndStorePublishOneGeneration(t *testing.T) {
 	if completedEarly {
 		t.Fatal("Store published between Freshen's generation check and header commit")
 	}
+	assertGenerationBudgetEntry(t, c, key, "newB", `"v2"`)
+}
+
+func assertGenerationBudgetEntry(t *testing.T, c *cache, key, wantBody, wantETag string) {
+	t.Helper()
 	current, err := c.Retrieve(key)
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +144,7 @@ func TestCacheFreshenAndStorePublishOneGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(body) != "newB" || current.Header().Get("Etag") != `"v2"` {
+	if string(body) != wantBody || current.Header().Get("Etag") != wantETag {
 		t.Fatalf("mixed generation: body=%q Etag=%q", body, current.Header().Get("Etag"))
 	}
 }

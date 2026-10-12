@@ -52,6 +52,13 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 		}
 		return applyValidationResponse(req.Request, res, exchange.status, exchange.snapshot, start), false
 	}
+	if retryOriginalPreconditions(exchange.status, req.Request, out) {
+		// Error responses can omit representation validators, so the delivery
+		// wrapper cannot reconstruct the result of the original conditions.
+		// Closing the pipe also releases a producer blocked on the error body.
+		_ = exchange.reader.Close()
+		return false, false
+	}
 	if exchange.status == http.StatusPartialContent {
 		keys := req.validationKeys()
 		h.recordStale(keys...)
@@ -76,6 +83,17 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 		}
 	}), start)
 	return false, true
+}
+
+func retryOriginalPreconditions(status int, original, validation *http.Request) bool {
+	if status != http.StatusRequestedRangeNotSatisfiable && status != http.StatusPreconditionFailed {
+		return false
+	}
+	if original.Header.Get("If-None-Match") == "" && original.Header.Get("If-Modified-Since") == "" {
+		return false
+	}
+	return combinedHeaderValues(original.Header, "If-None-Match") != combinedHeaderValues(validation.Header, "If-None-Match") ||
+		combinedHeaderValues(original.Header, "If-Modified-Since") != combinedHeaderValues(validation.Header, "If-Modified-Since")
 }
 
 func copyValidationTrailers(dst, final, initial http.Header) {

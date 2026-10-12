@@ -1194,6 +1194,11 @@ func (c *cache) freshenResourceForKey(res *Resource, key string) (bool, error) {
 	if err := c.reserveEntry(hashedKey, newSize); err != nil {
 		return false, fmt.Errorf("failed to admit freshening target %q: %w", key, err)
 	}
+	return false, c.commitFreshenedHeader(key, hashedKey, headerData, newSize, freshenedAt)
+}
+
+// Called while the key writer lock and capacity reservation remain held.
+func (c *cache) commitFreshenedHeader(key, hashedKey string, headerData []byte, newSize int64, freshenedAt time.Time) error {
 	header, _, err := c.stageSerializedHeader(headerData, key)
 	if err == nil {
 		err = c.commitStaged(header)
@@ -1205,12 +1210,12 @@ func (c *cache) freshenResourceForKey(res *Resource, key string) (bool, error) {
 				err = errors.Join(err, discardErr)
 			}
 		}
-		return false, fmt.Errorf("failed to freshen header for key %q: %w", key, err)
+		return fmt.Errorf("failed to freshen header for key %q: %w", key, err)
 	}
 	// Header growth consumes real capacity too. Convert this reservation and
 	// advance its persisted generation together in the LRU ledger.
 	c.trackEntry(key, hashedKey, newSize, freshenedAt)
-	return false, nil
+	return nil
 }
 
 func hashKey(key string) string {
