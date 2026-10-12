@@ -79,9 +79,13 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 		_ = exchange.reader.Close()
 		return false, false
 	}
-	if varyChangedClientValidators(combinedHeaderValues(exchange.snapshot, "Vary"), req.Request, out) {
-		// Rewriting a selecting field can produce another representation.
-		// Fetch with the original request before delivering or storing it.
+	if fullResponseVaryChanged(exchange.status, res.Header(), exchange.snapshot) ||
+		varyChangedClientValidators(combinedHeaderValues(exchange.snapshot, "Vary"), req.Request, out) {
+		// A changed selection policy needs the discovery key fenced too, and a
+		// rewritten selecting validator can produce another representation.
+		// The ordinary refetch fences all validation keys before taking a new
+		// fetch-start timestamp. Reusing this exchange with a later timestamp
+		// would make a response already in flight during a mutation appear newer.
 		_ = exchange.reader.Close()
 		return false, false
 	}
@@ -103,6 +107,11 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 	}), start)
 	finishValidationTrailers(req.Context(), client, exchange, copied)
 	return false, true
+}
+
+func fullResponseVaryChanged(status int, previous, replacement http.Header) bool {
+	return status >= http.StatusOK && status < http.StatusMultipleChoices &&
+		!sameVaryFields(combinedHeaderValues(previous, "Vary"), combinedHeaderValues(replacement, "Vary"))
 }
 
 func (req *cacheRequest) validationResourceKey() string {

@@ -55,19 +55,7 @@ func TestCoordinatedRetriesCountOneNativeMissPerClient(t *testing.T) {
 					defer releaseFirst()
 					var calls atomic.Int64
 					payload := strings.Repeat("p", 4096)
-					h := NewHandlerWithOptions(backend, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-						if calls.Add(1) == 1 {
-							close(entered)
-							<-release
-						}
-						policy := "no-store"
-						if failedStore {
-							policy = "max-age=3600"
-						}
-						w.Header().Set("Cache-Control", policy)
-						w.Header().Set("Content-Length", "4096")
-						_, _ = io.WriteString(w, payload)
-					}), &HandlerOptions{MissCoordinator: coord})
+					h := NewHandlerWithOptions(backend, nativeMissStatsOrigin(&calls, entered, release, failedStore, payload), &HandlerOptions{MissCoordinator: coord})
 					h.SetMetrics(metrics)
 					done := make(chan *httptest.ResponseRecorder, clients)
 					for range clients {
@@ -86,26 +74,47 @@ func TestCoordinatedRetriesCountOneNativeMissPerClient(t *testing.T) {
 						assertReviewVaryBody(t, featureAwait(t, done), payload)
 					}
 					h.writes.Wait()
-					if calls.Load() != clients || coord.acquired.Load() != clients || coord.released.Load() != clients {
-						t.Fatalf("fills lost bounded ownership: calls=%d leases=%d/%d", calls.Load(), coord.acquired.Load(), coord.released.Load())
-					}
-					if wrapper != nil && wrapper.calls.Load() < clients {
-						t.Fatalf("wrapper quiet lookup was bypassed: rechecks=%d", wrapper.calls.Load())
-					}
-					stats := c.Stats()
-					if stats.MissCount != clients || stats.HitCount != 0 || stats.ItemCount != 0 || metrics.misses.Load() != clients {
-						t.Fatalf("internal rechecks inflated client misses: native=%+v handler=%d, want %d misses", stats, metrics.misses.Load(), clients)
-					}
-					wantFailures := int64(0)
-					if failedStore {
-						wantFailures = clients
-					}
-					if got := metrics.storeFailures.Load(); got != wantFailures {
-						t.Fatalf("backend failure path not exercised: %d failures, want %d", got, wantFailures)
-					}
+					assertNativeMissStats(t, c, wrapper, coord, metrics, &calls, clients, failedStore)
 				})
 			}
 		}
+	}
+}
+
+func nativeMissStatsOrigin(calls *atomic.Int64, entered, release chan struct{}, failedStore bool, payload string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		policy := "no-store"
+		if failedStore {
+			policy = "max-age=3600"
+		}
+		w.Header().Set("Cache-Control", policy)
+		w.Header().Set("Content-Length", "4096")
+		_, _ = io.WriteString(w, payload)
+	}
+}
+
+func assertNativeMissStats(t *testing.T, c *cache, wrapper *exportedNativeRecheckCache, coord *handlerHerdCoordinator, metrics *nativeMissStatsMetrics, calls *atomic.Int64, clients int64, failedStore bool) {
+	t.Helper()
+	if calls.Load() != clients || coord.acquired.Load() != clients || coord.released.Load() != clients {
+		t.Fatalf("fills lost bounded ownership: calls=%d leases=%d/%d", calls.Load(), coord.acquired.Load(), coord.released.Load())
+	}
+	if wrapper != nil && wrapper.calls.Load() < clients {
+		t.Fatalf("wrapper quiet lookup was bypassed: rechecks=%d", wrapper.calls.Load())
+	}
+	stats := c.Stats()
+	if stats.MissCount != clients || stats.HitCount != 0 || stats.ItemCount != 0 || metrics.misses.Load() != clients {
+		t.Fatalf("internal rechecks inflated client misses: native=%+v handler=%d, want %d misses", stats, metrics.misses.Load(), clients)
+	}
+	wantFailures := int64(0)
+	if failedStore {
+		wantFailures = clients
+	}
+	if got := metrics.storeFailures.Load(); got != wantFailures {
+		t.Fatalf("backend failure path not exercised: %d failures, want %d", got, wantFailures)
 	}
 }
 
@@ -128,27 +137,30 @@ func TestNativeRecheckPreservesDirectLookupAndIntegrityAccounting(t *testing.T) 
 	if err := c.Store(integrityFeatureResource("payload"), "present"); err != nil {
 		t.Fatal(err)
 	}
-	res, err := rechecker.RetrieveForRecheck("present")
+	assertNativeRecheckPresent(t, c, rechecker.RetrieveForRecheck, 0, "quiet recheck changed public lookup accounting")
+	assertNativeRecheckPresent(t, c, c.Retrieve, 1, "ordinary successful lookup lost its hit count")
+	assertNativeRecheckCorruption(t, c, rechecker.RetrieveForRecheck)
+}
+
+func assertNativeRecheckPresent(t *testing.T, c *cache, retrieve func(string) (*Resource, error), wantHits int64, message string) {
+	t.Helper()
+	res, err := retrieve("present")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = res.Close()
-	if stats := c.Stats(); stats.MissCount != 1 || stats.HitCount != 0 {
-		t.Fatalf("quiet recheck changed public lookup accounting: %+v", stats)
+	if stats := c.Stats(); stats.MissCount != 1 || stats.HitCount != wantHits {
+		t.Fatalf("%s: %+v", message, stats)
 	}
-	res, err = c.Retrieve("present")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = res.Close()
-	if stats := c.Stats(); stats.MissCount != 1 || stats.HitCount != 1 {
-		t.Fatalf("ordinary successful lookup lost its hit count: %+v", stats)
-	}
+}
+
+func assertNativeRecheckCorruption(t *testing.T, c *cache, retrieveForRecheck func(string) (*Resource, error)) {
+	t.Helper()
 	path := integrityFeaturePath(c.diskRoot, bodyPrefix, "present")
 	if err := os.WriteFile(path, []byte("tampered"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rechecker.RetrieveForRecheck("present"); !errors.Is(err, ErrNotFoundInCache) {
+	if _, err := retrieveForRecheck("present"); !errors.Is(err, ErrNotFoundInCache) {
 		t.Fatalf("recheck did not discard corruption: %v", err)
 	}
 	if stats := c.Stats(); stats.MissCount != 1 || stats.ItemCount != 0 {

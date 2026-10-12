@@ -82,14 +82,16 @@ func TestReviewHeadVaryRebuildInvalidatesGetDiscovery(t *testing.T) {
 			}
 			// The other language's GET variant has never been selected by HEAD.
 			// Its old discovery base must nevertheless fence that representation.
+			// Its full validation changes Vary too, so rebuild after fencing the
+			// discovery policy rather than publishing that earlier response.
 			get := reviewServeConditionalVary(h, headVaryRebuildRequest("GET", "fr", false))
 			assertReviewVaryBody(t, get, "variant A")
-			if get.Header().Get("Vary") != "Accept-Encoding" || origin.calls.Load() != 5 {
+			if get.Header().Get("Vary") != "Accept-Encoding" || origin.calls.Load() != 6 {
 				t.Fatalf("GET reused the old HEAD-fallback discovery index: calls=%d headers=%v", origin.calls.Load(), get.Header())
 			}
 			hit := reviewServeConditionalVary(h, headVaryRebuildRequest("GET", "en", false))
 			assertReviewVaryBody(t, hit, "variant A")
-			if hit.Header().Get(CacheHeader) != "HIT" || origin.calls.Load() != 5 {
+			if hit.Header().Get(CacheHeader) != "HIT" || origin.calls.Load() != 6 {
 				t.Fatalf("rebuilt GET policy was not reused across languages: calls=%d headers=%v", origin.calls.Load(), hit.Header())
 			}
 		})
