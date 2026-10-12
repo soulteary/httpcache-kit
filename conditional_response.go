@@ -52,6 +52,11 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 		}
 		return applyValidationResponse(req.Request, res, exchange.status, exchange.snapshot, start), false
 	}
+	if exchange.status == http.StatusPartialContent {
+		keys := req.validationKeys()
+		h.recordStale(keys...)
+		h.cache.Invalidate(keys...)
+	}
 	h.passUpstreamWithHandler(newClientPreconditionWriter(w, req.Request), req, nil, http.HandlerFunc(func(dst http.ResponseWriter, _ *http.Request) {
 		for name, values := range exchange.snapshot {
 			dst.Header()[name] = append([]string(nil), values...)
@@ -63,6 +68,11 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 			}
 		} else {
 			copyValidationTrailers(dst.Header(), exchange.header, exchange.snapshot)
+			if stream, ok := dst.(*responseStreamer); ok {
+				if filtered, ok := stream.ResponseWriter.(interface{ finishTrailers() }); ok {
+					filtered.finishTrailers()
+				}
+			}
 		}
 	}), start)
 	return false, true
@@ -109,14 +119,12 @@ func (e *validationExchange) Write(body []byte) (int, error) {
 func (e *validationExchange) Flush() { e.WriteHeader(http.StatusOK) }
 func (e *validationExchange) serve(handler http.Handler, req *http.Request) {
 	defer func() {
-		e.WriteHeader(http.StatusOK)
 		if recovered := recover(); recovered != nil {
+			e.WriteHeader(http.StatusBadGateway)
 			_ = e.writer.CloseWithError(io.ErrUnexpectedEOF)
-			if recovered != http.ErrAbortHandler {
-				panic(recovered)
-			}
 			return
 		}
+		e.WriteHeader(http.StatusOK)
 		_ = e.writer.Close()
 	}()
 	handler.ServeHTTP(e, req)

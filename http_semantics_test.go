@@ -1,6 +1,7 @@
 package httpcache
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,104 @@ import (
 	"testing"
 	"time"
 )
+
+func TestConditionalRangeUsesOriginalClientPrecondition(t *testing.T) {
+	var calls atomic.Int64
+	c := NewMemoryCache().(ExtendedCache)
+	defer func() { _ = c.Close() }()
+	h := NewSharedHandler(c, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		w.Header().Set("Cache-Control", "max-age=3600")
+		if n == 1 {
+			w.Header().Set("ETag", `"v1"`)
+		} else {
+			w.Header().Set("ETag", `"v2"`)
+		}
+		http.ServeContent(w, r, "", time.Time{}, strings.NewReader("abcdef"))
+	}))
+	defer h.writes.Wait()
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "http://cache.example/index", nil))
+	h.writes.Wait()
+	r := httptest.NewRequest("GET", "http://cache.example/index", nil)
+	r.Header.Set("If-None-Match", `"v2"`)
+	r.Header.Set("Range", "bytes=0-2")
+	r.Header.Set("Cache-Control", "min-fresh=7200")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	h.writes.Wait()
+	if w.Code != 304 || w.Body.Len() != 0 || calls.Load() != 2 {
+		t.Fatalf("partial client precondition failed: %d %q calls=%d", w.Code, w.Body.String(), calls.Load())
+	}
+}
+
+func TestConditionalValidatorPanicBecomesFailedResponse(t *testing.T) {
+	var calls atomic.Int64
+	c := NewMemoryCache().(ExtendedCache)
+	defer func() { _ = c.Close() }()
+	h := NewSharedHandler(c, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) > 1 {
+			panic("upstream panic")
+		}
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Cache-Control", "max-age=3600")
+		_, _ = io.WriteString(w, "body")
+	}))
+	defer h.writes.Wait()
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "http://cache.example/index", nil))
+	h.writes.Wait()
+	r := httptest.NewRequest("GET", "http://cache.example/index", nil)
+	r.Header.Set("Cache-Control", "min-fresh=7200")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 502 || calls.Load() != 2 {
+		t.Fatalf("panic response=%d calls=%d", w.Code, calls.Load())
+	}
+}
+
+func TestConditionalClientWrapperPreservesNetworkTrailers(t *testing.T) {
+	var calls atomic.Int64
+	c := NewMemoryCache().(ExtendedCache)
+	defer func() { _ = c.Close() }()
+	h := NewSharedHandler(c, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := calls.Add(1)
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("ETag", `"v1"`)
+		if n > 1 {
+			w.Header().Set("ETag", `"v2"`)
+			w.Header().Set("Trailer", "X-Declared")
+		}
+		_, _ = io.WriteString(w, "body")
+		if n > 1 {
+			w.Header().Set("X-Declared", "done")
+			w.Header().Set(http.TrailerPrefix+"X-Late", "late")
+		}
+	}))
+	defer func() { _ = h.Shutdown(context.Background()) }()
+	server := httptest.NewServer(h)
+	defer server.Close()
+	first, err := http.Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, first.Body)
+	_ = first.Body.Close()
+	h.writes.Wait()
+	r, err := http.NewRequest("GET", server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Header.Set("Cache-Control", "min-fresh=7200")
+	r.Header.Set("If-None-Match", `"unmatched"`)
+	res, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = io.Copy(io.Discard, res.Body)
+	_ = res.Body.Close()
+	if err != nil || res.StatusCode != 200 || res.Trailer.Get("X-Declared") != "done" || res.Trailer.Get("X-Late") != "late" {
+		t.Fatalf("lost trailers: status=%d trailer=%+v err=%v", res.StatusCode, res.Trailer, err)
+	}
+}
 
 func TestConditionalFullResponseIsReusedAndStored(t *testing.T) {
 	var calls atomic.Int64
