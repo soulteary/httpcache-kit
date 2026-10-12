@@ -437,3 +437,38 @@ func TestIntegritySHA256DiscardDoesNotDeleteNewerReplacement(t *testing.T) {
 	c.(*cache).discardCorrupt(key, fault)
 	integrityFeatureBody(t, c, key, "new-package")
 }
+
+func TestIntegrityHeaderRejectsCorruptOrMissingBody(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprint(missing), func(t *testing.T) {
+			dir := t.TempDir()
+			c := integrityFeatureCache(t, dir, IntegritySHA256)
+			const key, neighbor = "broken", "neighbor"
+			if err := c.Store(integrityFeatureResource("payload"), key, neighbor); err != nil {
+				t.Fatal(err)
+			}
+			p := integrityFeaturePath(dir, bodyPrefix, key)
+			if missing {
+				if err := os.Remove(p); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.WriteFile(p, []byte("damaged"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := c.Stats().MissCount
+			h, err := c.Header(key)
+			if !errors.Is(err, ErrNotFoundInCache) || h.StatusCode != 0 {
+				t.Fatalf("Header exposed corrupted entry: %+v, %v", h, err)
+			}
+			if c.Stats().MissCount != before+1 {
+				t.Fatal("integrity header miss was not counted")
+			}
+			if _, err := os.Stat(integrityFeaturePath(dir, headerPrefix, key)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("corrupt header remains: %v", err)
+			}
+			integrityFeatureBody(t, c, neighbor, "payload")
+		})
+	}
+}

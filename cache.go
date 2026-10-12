@@ -582,9 +582,32 @@ func atomicWriteFile(path string, r io.Reader) (int64, error) {
 
 // Retrieve the Status and Headers for a given key path
 func (c *cache) Header(key string) (Header, error) {
-	path := headerPrefix + formatPrefix + hashKey(key)
-	h, _, err := c.readHeaderFile(path, key)
+	h, err := c.header(key)
 	return h, c.integrityMiss(key, err)
+}
+
+func (c *cache) header(key string) (Header, error) {
+	c.cleanupMu.RLock()
+	defer c.cleanupMu.RUnlock()
+	c.publishMu.RLock()
+	defer c.publishMu.RUnlock()
+	hashed := hashKey(key)
+	h, _, meta, err := c.readHeaderRecord(headerPrefix+formatPrefix+hashed, key)
+	if err != nil || meta == nil {
+		return h, err
+	}
+	f, err := c.fs.Open(bodyPrefix + formatPrefix + hashed)
+	if err != nil {
+		if vfs.IsNotExist(err) {
+			return Header{}, &corruptEntryError{fingerprint: meta.fingerprint, reason: "body missing"}
+		}
+		return Header{}, err
+	}
+	defer func() { _ = f.Close() }()
+	if err := verifyStoredBody(f, meta, meta.fingerprint); err != nil {
+		return Header{}, err
+	}
+	return h, nil
 }
 
 // readHeaderFile reads a stored response header and its separate cache
@@ -659,11 +682,6 @@ func (c *cache) readHeaderRecordWithKeyCheck(path, key string, checkKey bool) (H
 	}
 
 	return h, storedAt, meta, nil
-}
-
-func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
-	h, at, _, err := c.readHeaderRecord(path, key)
-	return h, at, err
 }
 
 // Store a resource against a number of keys. Resource bodies are streamed

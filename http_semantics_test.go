@@ -40,6 +40,32 @@ func TestConditionalRangeUsesOriginalClientPrecondition(t *testing.T) {
 	}
 }
 
+func TestVaryKeysPreserveDistinctFieldLineBoundaries(t *testing.T) {
+	var calls atomic.Int64
+	c := NewMemoryCache().(ExtendedCache)
+	defer func() { _ = c.Close() }()
+	h := NewSharedHandler(c, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Vary", "Cookie")
+		_, _ = io.WriteString(w, strings.Join(r.Header.Values("Cookie"), "|"))
+	}))
+	defer h.writes.Wait()
+	for _, values := range [][]string{{"session=a", "role=b"}, {"session=a, role=b"}, {"session=a, role=b"}} {
+		r := httptest.NewRequest("GET", "http://cache.example/index", nil)
+		r.Header["Cookie"] = values
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		h.writes.Wait()
+		if w.Body.String() != strings.Join(values, "|") {
+			t.Fatalf("field boundaries aliased: %q", w.Body.String())
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls=%d want2", calls.Load())
+	}
+}
+
 func TestConditionalValidatorPanicBecomesFailedResponse(t *testing.T) {
 	var calls atomic.Int64
 	c := NewMemoryCache().(ExtendedCache)
