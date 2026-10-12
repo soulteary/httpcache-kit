@@ -113,11 +113,10 @@ func (h *Handler) fullResponseVaryChanged(req *cacheRequest, status int, previou
 	if sameVaryFields(combinedHeaderValues(previous, "Vary"), combinedHeaderValues(replacement, "Vary")) {
 		return false
 	}
-	// Preserve successful-response rebuilding, and also fence policies from
-	// cacheable redirects and negative responses. Uncacheable errors must keep
-	// their original status/body rather than being replaced by another fetch.
-	return (status >= http.StatusOK && status < http.StatusMultipleChoices) ||
-		h.isCacheable(NewResourceBytes(status, nil, replacement), req)
+	// Only a response eligible for storage needs a rebuilt discovery index.
+	// Deliver an uncacheable replacement as received; the selected predecessor
+	// was already fenced before this fetch, so no extra origin request is needed.
+	return h.isCacheable(NewResource(status, nil, replacement), req)
 }
 
 func (req *cacheRequest) validationResourceKey() string {

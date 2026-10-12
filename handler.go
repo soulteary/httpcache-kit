@@ -1597,14 +1597,21 @@ func (rw *responseStreamer) CommitHeaders() {
 	rw.commitOnce.Do(func() {
 		if rw.deferHeaders {
 			dst := rw.ResponseWriter.Header()
-			for name := range dst {
-				delete(dst, name)
-			}
 			header := rw.responseHeader
 			if rw.clientHeader != nil {
 				header = rw.clientHeader
 			}
+			for name := range dst {
+				if _, present := header[name]; !rw.retainHeader || !present {
+					delete(dst, name)
+				}
+			}
 			for name, values := range header {
+				// Header.Values exposes the original value slice. Retained
+				// trailer references must stay live across the deferred commit.
+				if current, present := dst[name]; rw.retainHeader && present && slices.Equal(current, values) {
+					continue
+				}
 				dst[name] = append([]string(nil), values...)
 			}
 		}
