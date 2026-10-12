@@ -298,7 +298,7 @@ on := httpcache.IsDebugLogging()
 | Header | 取值 | 含义 |
 |--------|------|------|
 | `X-Cache` | `HIT` | 由缓存响应 |
-| | `MISS` | 回源取得并已存储 |
+| | `MISS` | 回源取得，是否入缓存取决于准入和后台写入结果 |
 | | `SKIP` | 不可缓存，或绕过了缓存 |
 | `Proxy-Date` | HTTP-date | 本缓存收到该响应的时间 |
 

@@ -414,7 +414,7 @@ on := httpcache.IsDebugLogging()
 | Header | Values | Meaning |
 |--------|--------|---------|
 | `X-Cache` | `HIT` | served from cache |
-| | `MISS` | fetched from upstream and stored |
+| | `MISS` | fetched from upstream; storage depends on admission and background write success |
 | | `SKIP` | not cacheable, or cache bypassed |
 | `Proxy-Date` | HTTP-date | when this cache received the response |
 
