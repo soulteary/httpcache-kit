@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,6 +43,17 @@ func testSetup() (*client, *upstreamServer) {
 	}
 
 	return &client{handler, cacheHandler}, upstream
+}
+
+// Validation fences and fetches need distinct local instants while retaining
+// the specification's HTTP dates and controlled time travel.
+func testSetupOrderedClock() (*client, *upstreamServer) {
+	client, upstream := testSetup()
+	var clockTicks atomic.Int64
+	httpcache.Clock = func() time.Time {
+		return upstream.Now.Add(time.Duration(clockTicks.Add(1)))
+	}
+	return client, upstream
 }
 
 func TestSpecResponseCacheControl(t *testing.T) {
@@ -301,7 +313,7 @@ func TestSpecCachingStatusCodes(t *testing.T) {
 }
 
 func TestSpecConditionalCaching(t *testing.T) {
-	client, upstream := testSetup()
+	client, upstream := testSetupOrderedClock()
 	upstream.Etag = `"llamas"`
 
 	r1 := client.get("/")
@@ -361,7 +373,7 @@ func TestSpecHeuristicCaching(t *testing.T) {
 }
 
 func TestSpecCacheControlTrumpsExpires(t *testing.T) {
-	client, upstream := testSetup()
+	client, upstream := testSetupOrderedClock()
 	upstream.LastModified = upstream.Now.AddDate(-1, 0, 0)
 	upstream.CacheControl = "max-age=2"
 	status := client.get("/").cacheStatus
@@ -457,7 +469,7 @@ func TestSpecCacheControlMaxStale(t *testing.T) {
 }
 
 func TestSpecValidatingStaleResponsesUnchanged(t *testing.T) {
-	client, upstream := testSetup()
+	client, upstream := testSetupOrderedClock()
 	upstream.CacheControl = "max-age=60"
 	upstream.Etag = `"llamas1"`
 	status := client.get("/").cacheStatus

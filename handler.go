@@ -280,7 +280,7 @@ func (h *Handler) resolveMiss(rw http.ResponseWriter, cReq *cacheRequest) (*Reso
 
 		select {
 		case <-flight.done:
-			res, err := h.lookup(cReq)
+			res, err := h.recheckMiss(cReq)
 			if err == nil {
 				// An invalidation can race the leader's completed Store. Return
 				// through the ordinary hit checks rather than bypass validation.
@@ -395,10 +395,21 @@ func (cReq *cacheRequest) validationKeys() []string {
 
 func (h *Handler) refetchCachedResponse(rw http.ResponseWriter, cReq *cacheRequest, res *Resource) {
 	_ = res.Close()
-	h.passUpstream(rw, cReq, nil)
+	keys := cReq.validationKeys()
+	h.recordStale(keys...)
+	h.cache.Invalidate(keys...)
+	refetch := *cReq
+	refetch.Time = Clock()
+	h.passUpstream(rw, &refetch, nil)
 }
 
 func (h *Handler) refetchChangedVaryResponse(rw http.ResponseWriter, cReq *cacheRequest, res *Resource) {
+	if varyUsesClientValidators(combinedHeaderValues(res.Header(), "Vary")) {
+		// Removing a varied condition changes which representation the origin
+		// selects. Preserve it, even when a 304 leaves no body to rebuild with.
+		h.refetchCachedResponse(rw, cReq, res)
+		return
+	}
 	_ = res.Close()
 	// Rebuilding the index needs a body even when the client's validators
 	// match. Preserve other preconditions and Range at the origin, while the
@@ -407,12 +418,15 @@ func (h *Handler) refetchChangedVaryResponse(rw http.ResponseWriter, cReq *cache
 	fetch.Header.Del("If-None-Match")
 	fetch.Header.Del("If-Modified-Since")
 	client := newClientPreconditionWriter(rw, cReq.Request)
-	finished := make(chan struct{})
+	// Vary must describe the request that produced the stored response. Keep
+	// the original base/policy identity, but select its variant from the
+	// unconditional fetch rather than the client's removed validators.
 	// The old keys were just invalidated. Record the rebuild after that
 	// barrier for third-party caches tracked through localFresh as well.
 	rebuilt := *cReq
 	rebuilt.Request = fetch // Storage variants must describe the headers sent upstream.
 	rebuilt.Time = Clock()
+	finished := make(chan struct{})
 	h.passUpstreamWithHandler(client, &rebuilt, nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		defer close(finished)
 		h.upstream.ServeHTTP(w, fetch)
@@ -1118,9 +1132,27 @@ type staleSnapshotChecker interface {
 // lookupResource finds the best matching Resource for the
 // request, or nil and ErrNotFoundInCache if none is found
 func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
+	return h.lookupUsing(req, h.cache.Retrieve)
+}
+
+// coordinationRetriever is deliberately package-private: an opaque Cache keeps
+// control over the accounting and behavior of its public Retrieve method.
+type coordinationRetriever interface {
+	retrieveUncounted(string) (*Resource, error)
+}
+
+func (h *Handler) recheckMiss(req *cacheRequest) (*Resource, error) {
+	retrieve := h.cache.Retrieve
+	if cache, ok := h.cache.(coordinationRetriever); ok {
+		retrieve = cache.retrieveUncounted
+	}
+	return h.lookupUsing(req, retrieve)
+}
+
+func (h *Handler) lookupUsing(req *cacheRequest, retrieve func(string) (*Resource, error)) (*Resource, error) {
 	// A miss retry can select a different base or Vary policy.
 	req.discoveryKey, req.servedKey = "", ""
-	res, lookupKey, err := h.lookupBaseResource(req)
+	res, lookupKey, err := h.lookupBaseUsing(req, retrieve)
 	if err != nil {
 		return res, err
 	}
@@ -1135,22 +1167,27 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 	h.markInvalidatedResource(res, baseKey, baseKey, false)
 
 	if vary := combinedHeaderValues(res.Header(), "Vary"); vary != "" {
-		return h.lookupVaryResource(req, res, lookupKey, vary)
+		return h.lookupVaryResource(req, res, lookupKey, vary, retrieve)
 	}
 	return res, nil
 }
 
 // lookupBaseResource also applies the narrower GET-to-HEAD fallback policy.
 func (h *Handler) lookupBaseResource(req *cacheRequest) (*Resource, Key, error) {
+	return h.lookupBaseUsing(req, h.cache.Retrieve)
+}
+
+func (h *Handler) lookupBaseUsing(req *cacheRequest, retrieve func(string) (*Resource, error)) (*Resource, Key, error) {
+	req.discoveryKey, req.servedKey = "", ""
 	lookupKey := req.Key
 	baseKey := lookupKey.String()
-	res, err := h.cache.Retrieve(baseKey)
+	res, err := retrieve(baseKey)
 
 	// HEAD requests can possibly be served from GET
 	if err == ErrNotFoundInCache && req.Method == "HEAD" {
 		lookupKey = req.Key.ForMethod("GET")
 		baseKey = lookupKey.String()
-		res, err = h.cache.Retrieve(baseKey)
+		res, err = retrieve(baseKey)
 		if err != nil {
 			return nil, lookupKey, err
 		}
@@ -1163,10 +1200,13 @@ func (h *Handler) lookupBaseResource(req *cacheRequest) (*Resource, Key, error) 
 			return nil, lookupKey, ErrNotFoundInCache
 		}
 	}
+	if err == nil {
+		req.discoveryKey = baseKey
+	}
 	return res, lookupKey, err
 }
 
-func (h *Handler) lookupVaryResource(req *cacheRequest, base *Resource, lookupKey Key, vary string) (*Resource, error) {
+func (h *Handler) lookupVaryResource(req *cacheRequest, base *Resource, lookupKey Key, vary string, retrieve func(string) (*Resource, error)) (*Resource, error) {
 	if varyWildcard(vary) {
 		_ = base.Close()
 		return nil, ErrNotFoundInCache
@@ -1175,7 +1215,7 @@ func (h *Handler) lookupVaryResource(req *cacheRequest, base *Resource, lookupKe
 	baseStale := base.IsStale()
 	baseKey := lookupKey.String()
 	variantKey := lookupKey.Vary(vary, req.Request).String()
-	varied, err := h.cache.Retrieve(variantKey)
+	varied, err := retrieve(variantKey)
 	// The primary entry is not the one we serve, and nothing else will
 	// close it. Releasing it here is what keeps the disk backend from
 	// leaking a file handle on every Vary lookup.
@@ -1195,6 +1235,13 @@ func (h *Handler) lookupVaryResource(req *cacheRequest, base *Resource, lookupKe
 // not accidentally make the other variants fresh again. Cache-provided markers
 // take precedence over the base entry's stale flag.
 func (h *Handler) markInvalidatedResource(res *Resource, resourceKey, baseKey string, baseStale bool) {
+	// Validation fences only its selected variant. An opaque cache may still
+	// return that old entry as fresh, so enforce its independent marker too.
+	if resourceKey != baseKey {
+		if staleAt, marked := h.staleAt(resourceKey); marked && !h.resourceFreshAfter(res, resourceKey, staleAt) {
+			res.MarkStale()
+		}
+	}
 	if staleAt, marked := h.staleAt(baseKey); marked {
 		// StoredAfter, not ReceivedAfter: HTTP dates are second-granular and
 		// the marker is not, so a same-second revalidation must still clear it.

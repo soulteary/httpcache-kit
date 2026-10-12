@@ -20,33 +20,7 @@ func TestChangedVaryRebuildStoresFullResponseForMatchingClientConditions(t *test
 				var changed atomic.Bool
 				var full, validations atomic.Int64
 				modified := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
-				h := NewSharedHandler(cache, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					body, vary := "variant A", "Accept-Language"
-					if changed.Load() {
-						vary = "Accept-Encoding"
-						if r.Header.Get("Accept-Encoding") == "br" {
-							body = "variant B"
-						}
-					} else if r.Header.Get("Accept-Language") == "fr" {
-						body = "variant B"
-					}
-					w.Header().Set("Cache-Control", "max-age=3600")
-					w.Header().Set("Vary", vary)
-					etagValue := `"variant-A"`
-					if body == "variant B" {
-						etagValue = `"variant-B"`
-					}
-					w.Header().Set("ETag", etagValue)
-					w.Header().Set("Last-Modified", modified.Format(http.TimeFormat))
-					etag := r.Header.Get("If-None-Match")
-					if etag == w.Header().Get("ETag") || (etag == "" && r.Header.Get("If-Modified-Since") == modified.Format(http.TimeFormat)) {
-						validations.Add(1)
-						w.WriteHeader(http.StatusNotModified)
-						return
-					}
-					full.Add(1)
-					_, _ = io.WriteString(w, body)
-				}))
+				h := NewSharedHandler(cache, followupChangedVaryOrigin(&changed, &full, &validations, modified))
 				defer h.writes.Wait()
 				assertReviewVaryBody(t, reviewVaryRequest(h, "en", "gzip", false), "variant A")
 				assertReviewVaryBody(t, reviewVaryRequest(h, "fr", "gzip", false), "variant B")
@@ -89,6 +63,36 @@ func TestChangedVaryRebuildStoresFullResponseForMatchingClientConditions(t *test
 	}
 }
 
+func followupChangedVaryOrigin(changed *atomic.Bool, full, validations *atomic.Int64, modified time.Time) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, vary := "variant A", "Accept-Language"
+		if changed.Load() {
+			vary = "Accept-Encoding"
+			if r.Header.Get("Accept-Encoding") == "br" {
+				body = "variant B"
+			}
+		} else if r.Header.Get("Accept-Language") == "fr" {
+			body = "variant B"
+		}
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("Vary", vary)
+		etagValue := `"variant-A"`
+		if body == "variant B" {
+			etagValue = `"variant-B"`
+		}
+		w.Header().Set("ETag", etagValue)
+		w.Header().Set("Last-Modified", modified.Format(http.TimeFormat))
+		etag := r.Header.Get("If-None-Match")
+		if etag == w.Header().Get("ETag") || (etag == "" && r.Header.Get("If-Modified-Since") == modified.Format(http.TimeFormat)) {
+			validations.Add(1)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		full.Add(1)
+		_, _ = io.WriteString(w, body)
+	})
+}
+
 func TestClientPreconditionsApplyToEverySuccessfulStatus(t *testing.T) {
 	modified := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
 	for _, status := range []int{http.StatusOK, http.StatusCreated, http.StatusAccepted, http.StatusNonAuthoritativeInfo, http.StatusNoContent, http.StatusResetContent, http.StatusPartialContent, http.StatusMultiStatus, http.StatusAlreadyReported, http.StatusIMUsed} {
@@ -128,22 +132,7 @@ func TestValidationAppliesOriginalConditionsToNoContentResponse(t *testing.T) {
 			cache := generationBudgetCache(t, false, 1<<20)
 			var calls atomic.Int64
 			modified := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
-			h := NewSharedHandler(cache, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Cache-Control", "max-age=3600")
-				if calls.Add(1) == 1 {
-					w.Header().Set("ETag", `"old"`)
-					w.Header().Set("Last-Modified", modified.Add(-time.Hour).Format(http.TimeFormat))
-					_, _ = io.WriteString(w, "old representation")
-					return
-				}
-				w.Header().Set("ETag", `"current"`)
-				w.Header().Set("Last-Modified", modified.Format(http.TimeFormat))
-				if r.Header.Get("If-None-Match") == `"current"` {
-					w.WriteHeader(http.StatusNotModified)
-					return
-				}
-				w.WriteHeader(http.StatusNoContent)
-			}))
+			h := NewSharedHandler(cache, followupNoContentOrigin(&calls, modified))
 			defer h.writes.Wait()
 			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://cache.example/object", nil))
 			h.writes.Wait()
@@ -185,6 +174,25 @@ func TestValidationAppliesOriginalConditionsToNoContentResponse(t *testing.T) {
 			}
 		})
 	}
+}
+
+func followupNoContentOrigin(calls *atomic.Int64, modified time.Time) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=3600")
+		if calls.Add(1) == 1 {
+			w.Header().Set("ETag", `"old"`)
+			w.Header().Set("Last-Modified", modified.Add(-time.Hour).Format(http.TimeFormat))
+			_, _ = io.WriteString(w, "old representation")
+			return
+		}
+		w.Header().Set("ETag", `"current"`)
+		w.Header().Set("Last-Modified", modified.Format(http.TimeFormat))
+		if r.Header.Get("If-None-Match") == `"current"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 }
 
 // Range selection remains the upstream's responsibility during a Vary rebuild;

@@ -35,7 +35,20 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 	if !ok || req.Context().Err() != nil {
 		return false, false
 	}
+	// The validation may replace this representation with a full response.
+	// Fence its predecessor before fetching, so failed staging or publication
+	// cannot leave the old body reusable. A Vary discovery base can contain a
+	// different fresh variant, so fence only this lookup's selected resource.
+	// Starting after this barrier preserves a real mutation's ordering.
+	key := req.validationResourceKey()
+	h.recordStale(key)
+	h.cache.Invalidate(key)
+	if req.Context().Err() != nil {
+		return false, false
+	}
 	start := Clock()
+	validation := *req
+	validation.Request, validation.Time = out, start
 	exchange := newValidationExchange()
 	stop := context.AfterFunc(req.Context(), func() { _ = exchange.reader.CloseWithError(req.Context().Err()) })
 	defer stop()
@@ -66,18 +79,15 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 		_ = exchange.reader.Close()
 		return false, false
 	}
-	// An unstoreable successful response replaces the old representation too.
-	// Retaining its predecessor as a fresh HIT would serve obsolete content
-	// after responses such as 204 or a new 200 carrying no-store.
-	replacement := NewResourceBytes(exchange.status, nil, exchange.snapshot)
-	if exchange.status >= http.StatusOK && exchange.status < http.StatusMultipleChoices && !h.isCacheable(replacement, req) {
-		keys := req.validationKeys()
-		h.recordStale(keys...)
-		h.cache.Invalidate(keys...)
+	if varyChangedClientValidators(combinedHeaderValues(exchange.snapshot, "Vary"), req.Request, out) {
+		// Rewriting a selecting field can produce another representation.
+		// Fetch with the original request before delivering or storing it.
+		_ = exchange.reader.Close()
+		return false, false
 	}
 	client := newClientPreconditionWriter(w, req.Request)
 	copied := make(chan bool, 1)
-	h.passUpstreamWithHandler(client, req, nil, http.HandlerFunc(func(dst http.ResponseWriter, _ *http.Request) {
+	h.passUpstreamWithHandler(client, &validation, nil, http.HandlerFunc(func(dst http.ResponseWriter, _ *http.Request) {
 		for name, values := range exchange.snapshot {
 			dst.Header()[name] = append([]string(nil), values...)
 		}
@@ -93,6 +103,16 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 	}), start)
 	finishValidationTrailers(req.Context(), client, exchange, copied)
 	return false, true
+}
+
+func (req *cacheRequest) validationResourceKey() string {
+	if req.servedKey != "" {
+		return req.servedKey
+	}
+	if req.discoveryKey != "" {
+		return req.discoveryKey
+	}
+	return req.Key.String()
 }
 
 func finishValidationTrailers(ctx context.Context, client http.ResponseWriter, exchange *validationExchange, copied <-chan bool) {

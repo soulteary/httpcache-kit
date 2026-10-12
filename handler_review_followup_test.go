@@ -22,33 +22,7 @@ func TestHEADVaryValidationInvalidatesActualGETDiscovery(t *testing.T) {
 				cache := generationBudgetCache(t, disk, 1<<20)
 				var changed atomic.Bool
 				var calls atomic.Int64
-				h := NewSharedHandler(cache, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					calls.Add(1)
-					language, vary := r.Header.Get("Accept-Language"), "Accept-Language"
-					w.Header().Set("Cache-Control", "max-age=3600")
-					if changed.Load() {
-						if policy == "no-store" {
-							w.Header().Set("Cache-Control", "no-store")
-						} else {
-							language, vary = "en", "Accept-Encoding"
-						}
-					}
-					w.Header().Set("Vary", vary)
-					etag := `"` + language + `-v1"`
-					// A HEAD 304 changes policy while retaining the selected body.
-					if changed.Load() && policy == "no-store" && r.Method == http.MethodGet {
-						etag = `"` + language + `-v2"`
-					}
-					w.Header().Set("ETag", etag)
-					if r.Header.Get("If-None-Match") == etag {
-						w.WriteHeader(http.StatusNotModified)
-						return
-					}
-					w.WriteHeader(http.StatusOK)
-					if r.Method != http.MethodHead {
-						_, _ = io.WriteString(w, etag)
-					}
-				}))
+				h := NewSharedHandler(cache, headVaryValidationOrigin(policy, &changed, &calls))
 				defer h.writes.Wait()
 				for _, language := range []string{"en", "fr"} {
 					r := httptest.NewRequest(http.MethodGet, "http://cache.example/head-vary", nil)
@@ -94,6 +68,36 @@ func TestHEADVaryValidationInvalidatesActualGETDiscovery(t *testing.T) {
 	}
 }
 
+func headVaryValidationOrigin(policy string, changed *atomic.Bool, calls *atomic.Int64) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		language, vary := r.Header.Get("Accept-Language"), "Accept-Language"
+		w.Header().Set("Cache-Control", "max-age=3600")
+		if changed.Load() {
+			if policy == "no-store" {
+				w.Header().Set("Cache-Control", "no-store")
+			} else {
+				language, vary = "en", "Accept-Encoding"
+			}
+		}
+		w.Header().Set("Vary", vary)
+		etag := `"` + language + `-v1"`
+		// A HEAD 304 changes policy while retaining the selected body.
+		if changed.Load() && policy == "no-store" && r.Method == http.MethodGet {
+			etag = `"` + language + `-v2"`
+		}
+		w.Header().Set("ETag", etag)
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = io.WriteString(w, etag)
+		}
+	}
+}
+
 func TestVaryRebuildStorageKeysUseActualUnconditionalRequest(t *testing.T) {
 	for _, field := range []string{"If-None-Match", "If-Modified-Since"} {
 		t.Run(field, func(t *testing.T) {
@@ -101,20 +105,7 @@ func TestVaryRebuildStorageKeysUseActualUnconditionalRequest(t *testing.T) {
 			var changed atomic.Bool
 			var calls atomic.Int64
 			modified := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Second)
-			h := NewSharedHandler(cache, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				calls.Add(1)
-				body, etag, date, vary := "conditional representation", `"conditional"`, modified, "Accept-Language"
-				if changed.Load() {
-					vary = field
-					if r.Header.Get(field) == "" {
-						body, etag, date = "unconditional representation", `"unconditional"`, modified.Add(time.Hour)
-					}
-				}
-				w.Header().Set("Cache-Control", "max-age=3600")
-				w.Header().Set("Vary", vary)
-				w.Header().Set("ETag", etag)
-				http.ServeContent(w, r, "", date, strings.NewReader(body))
-			}))
+			h := NewSharedHandler(cache, reviewSelectingConditionOrigin(field, &changed, &calls, modified))
 			defer h.writes.Wait()
 			warm := httptest.NewRequest(http.MethodGet, "http://cache.example/conditional-vary-key", nil)
 			warm.Header.Set("Accept-Language", "en")
@@ -132,13 +123,22 @@ func TestVaryRebuildStorageKeysUseActualUnconditionalRequest(t *testing.T) {
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, client)
 			h.writes.Wait()
-			assertReviewVaryBody(t, rec, "unconditional representation")
+			if rec.Code != http.StatusNotModified || rec.Body.Len() != 0 {
+				t.Fatalf("rebuild changed the client-selected representation: status=%d body=%q", rec.Code, rec.Body.String())
+			}
 			if !reflect.DeepEqual(original, client.Header) {
 				t.Fatal("storage fetch mutated the original client conditions")
 			}
 			unconditional := client.Clone(client.Context())
 			unconditional.Header.Del("If-None-Match")
 			unconditional.Header.Del("If-Modified-Since")
+			unconditional.Header.Del("Cache-Control")
+			// A matching 304 supplies no body. Rebuild the index from the next
+			// request that selects and fetches the unconditional representation.
+			rec = httptest.NewRecorder()
+			h.ServeHTTP(rec, unconditional)
+			h.writes.Wait()
+			assertReviewVaryBody(t, rec, "unconditional representation")
 			key := NewRequestKey(client)
 			stored, err := cache.Retrieve(key.Vary(field, unconditional).String())
 			if err != nil {
@@ -153,18 +153,37 @@ func TestVaryRebuildStorageKeysUseActualUnconditionalRequest(t *testing.T) {
 			h.ServeHTTP(rec, warm)
 			h.writes.Wait()
 			assertReviewVaryBody(t, rec, "unconditional representation")
-			if calls.Load() != 3 || rec.Header().Get(CacheHeader) != "HIT" {
+			if calls.Load() != 5 || rec.Header().Get(CacheHeader) != "HIT" {
 				t.Fatalf("unconditional variant was not reusable: calls=%d headers=%v", calls.Load(), rec.Header())
 			}
 			client.Header.Del("Cache-Control")
 			rec = httptest.NewRecorder()
 			h.ServeHTTP(rec, client)
 			h.writes.Wait()
-			if rec.Code != http.StatusNotModified || rec.Body.Len() != 0 || calls.Load() != 4 {
+			if rec.Code != http.StatusNotModified || rec.Body.Len() != 0 || calls.Load() != 6 {
 				t.Fatalf("conditional request reused the other representation: status=%d body=%q calls=%d", rec.Code, rec.Body.String(), calls.Load())
 			}
 		})
 	}
+}
+
+func reviewSelectingConditionOrigin(field string, changed *atomic.Bool, calls *atomic.Int64, modified time.Time) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		body, etag, date, vary := "conditional representation", `"conditional"`, modified, "Accept-Language"
+		if changed.Load() {
+			vary = field
+			if r.Header.Get(field) == "" {
+				body, etag, date = "unconditional representation", `"unconditional"`, modified.Add(time.Hour)
+			}
+		}
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("Vary", vary)
+		if field != "If-Modified-Since" {
+			w.Header().Set("ETag", etag)
+		}
+		http.ServeContent(w, r, "", date, strings.NewReader(body))
+	})
 }
 
 type handlerHerdOwnership struct{}
@@ -298,16 +317,21 @@ func TestCoordinatedUncacheableHerdRecordsOneMissAndKeepsBoundedStack(t *testing
 			if calls.Load() != clients || coord.acquired.Load() != clients || coord.released.Load() != clients {
 				t.Fatalf("fill ownership was lost: calls=%d acquired=%d released=%d", calls.Load(), coord.acquired.Load(), coord.released.Load())
 			}
-			if failedStore && (failing.stores.Load() != clients || failing.badOwnership.Load()) {
-				t.Fatalf("failed publication lost live lease context: stores=%d badContext=%v", failing.stores.Load(), failing.badOwnership.Load())
-			}
-			h.flightsMu.Lock()
-			remaining := len(h.flights)
-			h.flightsMu.Unlock()
-			if remaining != 0 {
-				t.Fatalf("herd stranded %d miss flights", remaining)
-			}
+			assertHandlerHerdStoreOwnership(t, h, failing, failedStore, clients)
 		})
+	}
+}
+
+func assertHandlerHerdStoreOwnership(t *testing.T, h *Handler, failing *handlerHerdFailedStore, failedStore bool, clients int64) {
+	t.Helper()
+	if failedStore && (failing.stores.Load() != clients || failing.badOwnership.Load()) {
+		t.Fatalf("failed publication lost live lease context: stores=%d badContext=%v", failing.stores.Load(), failing.badOwnership.Load())
+	}
+	h.flightsMu.Lock()
+	remaining := len(h.flights)
+	h.flightsMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("herd stranded %d miss flights", remaining)
 	}
 }
 

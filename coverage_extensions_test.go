@@ -36,7 +36,8 @@ func TestValidationCancellationUnblocksBeforeAndAfterHeaders(t *testing.T) {
 				<-req.Context().Done()
 				<-allowReturn
 			})
-			h := NewHandler(nil, upstream)
+			cache := generationBudgetCache(t, false, 1<<20)
+			h := NewHandler(cache, upstream)
 			request, err := newCacheRequest(httptest.NewRequest(http.MethodGet, "http://example.org/cancel", nil).WithContext(ctx))
 			if err != nil {
 				t.Fatal(err)
@@ -76,7 +77,7 @@ func awaitCoverageSignal(t *testing.T, signal <-chan struct{}) {
 }
 
 func TestValidationInterruptedNotModifiedDoesNotRefresh(t *testing.T) {
-	h := NewHandler(nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	h := NewHandler(generationBudgetCache(t, false, 1<<20), http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusEarlyHints)
 		w.WriteHeader(http.StatusNotModified)
 		panic("upstream interrupted after 304 headers")

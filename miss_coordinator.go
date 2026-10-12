@@ -55,7 +55,7 @@ func (h *Handler) leadMiss(w http.ResponseWriter, r *cacheRequest, complete func
 			callComplete(complete)
 		})
 	}
-	res, err := h.lookup(r)
+	res, err := h.recheckMiss(r)
 	if err == nil {
 		done()
 		return res, true

@@ -31,6 +31,11 @@ func (v *Validator) Validate(req *http.Request, res *Resource) bool {
 }
 
 func conditionalRequest(req *http.Request, res *Resource) (*http.Request, bool) {
+	// Replacing a field named by Vary selects another representation. Such
+	// entries must be fetched with the client's original conditions instead.
+	if varyUsesClientValidators(combinedHeaderValues(res.Header(), "Vary")) {
+		return nil, false
+	}
 	outreq := cloneRequest(req)
 	headers := canonicalValidationHeaders(res.Header())
 	switch {
@@ -42,6 +47,28 @@ func conditionalRequest(req *http.Request, res *Resource) (*http.Request, bool) 
 		return nil, false
 	}
 	return outreq, true
+}
+
+func varyUsesClientValidators(vary string) bool {
+	for _, field := range parseVary(vary) {
+		if field == "If-None-Match" || field == "If-Modified-Since" {
+			return true
+		}
+	}
+	return false
+}
+
+// A newly received Vary can reveal that the validation request selected a
+// different representation. Compare the exact field values used by Vary keys,
+// including absent fields, empty fields and multiple field lines.
+func varyChangedClientValidators(vary string, original, validation *http.Request) bool {
+	for _, field := range parseVary(vary) {
+		if (field == "If-None-Match" || field == "If-Modified-Since") &&
+			varyFieldKey(original.Header, field) != varyFieldKey(validation.Header, field) {
+			return true
+		}
+	}
+	return false
 }
 
 func applyValidationResponse(req *http.Request, res *Resource, status int, header http.Header, t time.Time) bool {

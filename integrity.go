@@ -170,10 +170,16 @@ func (c *cache) discardCorrupt(key string, fault *corruptEntryError) {
 }
 
 func (c *cache) integrityMiss(key string, err error) error {
+	return c.integrityResult(key, err, true)
+}
+
+func (c *cache) integrityResult(key string, err error, record bool) error {
 	var fault *corruptEntryError
 	if errors.As(err, &fault) {
 		c.discardCorrupt(key, fault)
-		c.recordMiss()
+		if record {
+			c.recordMiss()
+		}
 		return ErrNotFoundInCache
 	}
 	return err

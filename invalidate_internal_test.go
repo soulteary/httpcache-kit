@@ -988,9 +988,11 @@ func TestInvalidationSurvivesForACacheWithoutStaleAt(t *testing.T) {
 // validation within one second otherwise make the variant revalidate forever.
 func TestThirdPartyVariantValidationUsesPreciseHandlerTime(t *testing.T) {
 	originalClock := Clock
-	defer func() { Clock = originalClock }()
-	now := time.Now().UTC().Truncate(time.Second).Add(100 * time.Millisecond)
-	Clock = func() time.Time { return now }
+	base := time.Now().UTC().Truncate(time.Second).Add(100 * time.Millisecond)
+	var elapsed atomic.Int64
+	// Keep every operation in one HTTP-date second while retaining strict
+	// ordering between the validation fence and its later upstream start.
+	Clock = func() time.Time { return base.Add(time.Duration(elapsed.Add(1))) }
 
 	var upstreamHits int32
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1006,9 +1008,14 @@ func TestThirdPartyVariantValidationUsesPreciseHandlerTime(t *testing.T) {
 		_, _ = w.Write([]byte("body"))
 	})
 
-	cache := &hookedImpreciseCache{impreciseCache: impreciseCache{plainCache{inner: NewMemoryCache()}}}
+	inner := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0))
+	cache := &hookedImpreciseCache{impreciseCache: impreciseCache{plainCache{inner: inner}}}
 	h := NewHandler(cache, upstream)
-	t.Cleanup(func() { h.writes.Wait() })
+	t.Cleanup(func() {
+		h.writes.Wait()
+		_ = inner.Close()
+		Clock = originalClock
+	})
 	get := func() {
 		req := httptest.NewRequest("GET", "http://example.org/thing", nil)
 		req.Header.Set("Accept-Language", "en")
@@ -1017,12 +1024,12 @@ func TestThirdPartyVariantValidationUsesPreciseHandlerTime(t *testing.T) {
 
 	get()
 	h.writes.Wait()
-	now = now.Add(100 * time.Millisecond)
+	elapsed.Add(int64(100 * time.Millisecond))
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "http://example.org/thing", nil))
-	// The next request itself is received at the marker time. Cache retrieval
-	// then takes 100ms, so validation starts later in the same HTTP-date second.
-	// Recording the request's earlier cReq.Time would fail to clear the marker.
-	cache.afterRetrieve = func() { now = now.Add(100 * time.Millisecond) }
+	// Cache retrieval advances 100ms, so the request, the validation fence and
+	// its upstream start remain in one HTTP-date second. Recording the earlier
+	// cReq.Time instead of that start would fail to clear the fence.
+	cache.afterRetrieve = func() { elapsed.Add(int64(100 * time.Millisecond)) }
 
 	before := atomic.LoadInt32(&upstreamHits)
 	get() // one conditional validation
@@ -1035,6 +1042,9 @@ func TestThirdPartyVariantValidationUsesPreciseHandlerTime(t *testing.T) {
 	get()
 	if got := atomic.LoadInt32(&upstreamHits) - before; got != 0 {
 		t.Errorf("%d further upstream request(s) after validation, want 0", got)
+	}
+	if Clock().Format(http.TimeFormat) != base.Format(http.TimeFormat) {
+		t.Fatal("fixture advanced beyond the shared HTTP-date second")
 	}
 }
 

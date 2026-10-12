@@ -755,15 +755,8 @@ func (c *cache) StoreContext(ctx context.Context, res *Resource, keys ...string)
 		return c.discardPreparedStore(err, prepared)
 	}
 
-	expectedSize, hasExpectedSize := expectedBodySize(res.Header())
-	var files []*stagedEntry
-	for _, entry := range prepared {
-		if err := c.prepareResourceForKey(ctx, res, entry, expectedSize, hasExpectedSize); err != nil {
-			return fail(err)
-		}
-		files = append(files, entry.body, entry.header)
-	}
-	if err := ctx.Err(); err != nil {
+	files, err := c.prepareStoreEntries(ctx, res, prepared)
+	if err != nil {
 		return fail(err)
 	}
 	if !locked {
@@ -781,6 +774,23 @@ func (c *cache) StoreContext(ctx context.Context, res *Resource, keys ...string)
 		c.trackEntry(entry.key, entry.hashedKey, entry.size, entry.storedAt)
 	}
 	return nil
+}
+
+// prepareStoreEntries stages each target without exposing any disk generation.
+// Publication and rollback remain owned by StoreContext.
+func (c *cache) prepareStoreEntries(ctx context.Context, res *Resource, entries []*preparedCacheEntry) ([]*stagedEntry, error) {
+	expectedSize, hasExpectedSize := expectedBodySize(res.Header())
+	var files []*stagedEntry
+	for _, entry := range entries {
+		if err := c.prepareResourceForKey(ctx, res, entry, expectedSize, hasExpectedSize); err != nil {
+			return nil, err
+		}
+		files = append(files, entry.body, entry.header)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 // lockStoreKeys deduplicates target hashes while preserving the caller's key
@@ -984,11 +994,22 @@ func (c *cache) stageSerializedHeaderContext(ctx context.Context, headerData []b
 
 // Retrieve returns a cached Resource for the given key
 func (c *cache) Retrieve(key string) (*Resource, error) {
-	res, err := c.retrieve(key)
-	return res, c.integrityMiss(key, err)
+	return c.retrieveRecorded(key, true)
 }
 
-func (c *cache) retrieve(key string) (*Resource, error) {
+// retrieveUncounted performs a coordinator's internal recheck without counting
+// another public cache access. Verification, corruption cleanup and LRU updates
+// are identical to Retrieve.
+func (c *cache) retrieveUncounted(key string) (*Resource, error) {
+	return c.retrieveRecorded(key, false)
+}
+
+func (c *cache) retrieveRecorded(key string, record bool) (*Resource, error) {
+	res, err := c.retrieve(key, record)
+	return res, c.integrityResult(key, err, record)
+}
+
+func (c *cache) retrieve(key string, record bool) (*Resource, error) {
 	// Cleanup removes an expired entry and its invalidation marker as one
 	// generation transition. Holding the read side from file open through the
 	// marker check means a retrieval either observes the old file WITH its
@@ -1009,7 +1030,9 @@ func (c *cache) retrieve(key string) (*Resource, error) {
 	f, err := c.fs.Open(bodyPath)
 	if err != nil {
 		if vfs.IsNotExist(err) {
-			c.recordMiss()
+			if record {
+				c.recordMiss()
+			}
 			return nil, ErrNotFoundInCache
 		}
 		return nil, fmt.Errorf("failed to open body file %q for key %q: %w", bodyPath, key, err)
@@ -1018,7 +1041,9 @@ func (c *cache) retrieve(key string) (*Resource, error) {
 	if err != nil {
 		_ = f.Close()
 		if err == ErrNotFoundInCache {
-			c.recordMiss()
+			if record {
+				c.recordMiss()
+			}
 			return nil, ErrNotFoundInCache
 		}
 		return nil, fmt.Errorf("failed to retrieve header for key %q: %w", key, err)
@@ -1050,7 +1075,9 @@ func (c *cache) retrieve(key string) (*Resource, error) {
 
 	// Update LRU access time
 	c.touchEntry(hashedKey)
-	c.recordHit()
+	if record {
+		c.recordHit()
+	}
 
 	return res, nil
 }
