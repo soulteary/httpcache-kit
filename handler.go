@@ -1135,15 +1135,22 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 	return h.lookupUsing(req, h.cache.Retrieve)
 }
 
-// coordinationRetriever is deliberately package-private: an opaque Cache keeps
-// control over the accounting and behavior of its public Retrieve method.
+// cacheRechecker lets wrappers opt into quiet internal lookups while leaving
+// the public Cache interface and legacy cache accounting unchanged.
+type cacheRechecker interface {
+	RetrieveForRecheck(string) (*Resource, error)
+}
+
+// coordinationRetriever preserves the built-in cache's package-private path.
 type coordinationRetriever interface {
 	retrieveUncounted(string) (*Resource, error)
 }
 
 func (h *Handler) recheckMiss(req *cacheRequest) (*Resource, error) {
 	retrieve := h.cache.Retrieve
-	if cache, ok := h.cache.(coordinationRetriever); ok {
+	if cache, ok := h.cache.(cacheRechecker); ok {
+		retrieve = cache.RetrieveForRecheck
+	} else if cache, ok := h.cache.(coordinationRetriever); ok {
 		retrieve = cache.retrieveUncounted
 	}
 	return h.lookupUsing(req, retrieve)

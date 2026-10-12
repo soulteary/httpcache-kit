@@ -997,6 +997,14 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 	return c.retrieveRecorded(key, true)
 }
 
+// RetrieveForRecheck performs an internal fill recheck without counting another
+// public cache access. Both hit and miss counters stay unchanged; verification,
+// corruption cleanup and LRU updates retain their ordinary behavior. Wrappers
+// may forward this optional method without changing the public Cache interface.
+func (c *cache) RetrieveForRecheck(key string) (*Resource, error) {
+	return c.retrieveUncounted(key)
+}
+
 // retrieveUncounted performs a coordinator's internal recheck without counting
 // another public cache access. Verification, corruption cleanup and LRU updates
 // are identical to Retrieve.
