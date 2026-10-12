@@ -126,7 +126,7 @@ func (w *validationResponse) Flush() {
 func headersEqual(h1, h2 http.Header) bool {
 	for _, header := range validationHeaders {
 		if value := h2.Get(header); value != "" {
-			if h1.Get(header) != value && !(header == "Content-Encoding" && strings.EqualFold(h1.Get(header), value)) {
+			if h1.Get(header) != value && (header != "Content-Encoding" || !strings.EqualFold(h1.Get(header), value)) {
 				debugf("%s changed, %q != %q", header, value, h1.Get(header))
 				return false
 			}

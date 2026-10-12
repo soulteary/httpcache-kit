@@ -48,7 +48,7 @@ func TestAuthenticatedNoStoreAfterExistingRequestDirective(t *testing.T) {
 		} else {
 			w.Header().Add("Cache-Control", "no-store")
 		}
-		io.WriteString(w, body)
+		_, _ = io.WriteString(w, body)
 	})
 	h := NewSharedHandler(NewMemoryCache(), upstream)
 	t.Cleanup(func() { h.writes.Wait() })
@@ -103,7 +103,7 @@ func TestExplicitZeroFreshness(t *testing.T) {
 				hits.Add(1)
 				w.Header().Set("Cache-Control", policy)
 				w.Header().Set("Last-Modified", "Wed, 01 Jan 2020 00:00:00 GMT")
-				io.WriteString(w, "metadata")
+				_, _ = io.WriteString(w, "metadata")
 			}))
 			t.Cleanup(func() { h.writes.Wait() })
 			for i := 0; i < 2; i++ {
@@ -132,7 +132,7 @@ func TestValidatorRejectsNon304AndCanceledResponses(t *testing.T) {
 			validator := &Validator{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Length", "9")
 				w.WriteHeader(status)
-				io.WriteString(w, "new-index")
+				_, _ = io.WriteString(w, "new-index")
 			})}
 			if validator.Validate(httptest.NewRequest("GET", "http://cache.example/InRelease", nil), res) {
 				t.Fatalf("status %d accepted as validation", status)
@@ -185,7 +185,7 @@ func TestRepositoryValidationOverHTTP(t *testing.T) {
 				if n == 1 {
 					w.Header().Set("Etag", `"v1"`)
 					w.Header().Set("Content-Length", "9")
-					io.WriteString(w, "old-index")
+					_, _ = io.WriteString(w, "old-index")
 					return
 				}
 				if status == 304 {
@@ -194,7 +194,7 @@ func TestRepositoryValidationOverHTTP(t *testing.T) {
 				}
 				w.Header().Set("Content-Length", "9")
 				w.WriteHeader(status)
-				io.WriteString(w, "new-index")
+				_, _ = io.WriteString(w, "new-index")
 			}))
 			defer upstream.Close()
 			target, _ := url.Parse(upstream.URL)
@@ -202,7 +202,11 @@ func TestRepositoryValidationOverHTTP(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer cache.Close()
+			defer func() {
+				if err := cache.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
 			h := NewSharedHandler(cache, httputil.NewSingleHostReverseProxy(target))
 			request := func(validate bool) *httptest.ResponseRecorder {
 				req := httptest.NewRequest("GET", "http://cache.example/InRelease", nil)
@@ -278,7 +282,7 @@ func TestValidationCannotFreshenWithdrawnSharedPolicy(t *testing.T) {
 				w.Header().Set("Etag", `"v1"`)
 				if n == 1 {
 					w.Header().Set("Cache-Control", "public, max-age=3600")
-					io.WriteString(w, "complete")
+					_, _ = io.WriteString(w, "complete")
 					return
 				}
 				w.Header().Set("Cache-Control", policy)
@@ -286,7 +290,7 @@ func TestValidationCannotFreshenWithdrawnSharedPolicy(t *testing.T) {
 					w.WriteHeader(304)
 					return
 				}
-				io.WriteString(w, "complete")
+				_, _ = io.WriteString(w, "complete")
 			}))
 			t.Cleanup(func() { h.writes.Wait() })
 			get := func(directive string) *httptest.ResponseRecorder {
@@ -352,7 +356,11 @@ func TestShared304MetadataPolicyAndPrivacy(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			defer cache.Close()
+			defer func() {
+				if err := cache.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
 			for _, privateField := range []bool{false, true} {
 				t.Run(stringBool(privateField), func(t *testing.T) {
 					var hits atomic.Int64
@@ -371,7 +379,7 @@ func TestShared304MetadataPolicyAndPrivacy(t *testing.T) {
 							return
 						}
 						w.Header().Set("Cache-Control", "max-age=3600")
-						io.WriteString(w, "body")
+						_, _ = io.WriteString(w, "body")
 					}))
 					t.Cleanup(func() { h.writes.Wait() })
 					get := func(directive string) *httptest.ResponseRecorder {
