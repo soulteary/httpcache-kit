@@ -161,9 +161,9 @@ func TestResource_MaxAge_ExpiresInvalid(t *testing.T) {
 	r := NewResourceBytes(200, []byte("x"), http.Header{
 		"Expires": []string{"not-a-valid-date"},
 	})
-	_, err := r.MaxAge(false)
-	if err == nil {
-		t.Error("MaxAge with invalid Expires should error")
+	age, err := r.MaxAge(false)
+	if err != nil || age != 0 {
+		t.Errorf("invalid Expires should be immediately stale: max-age=%s err=%v", age, err)
 	}
 }
 

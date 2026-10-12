@@ -10,6 +10,24 @@ also changes the module path. The current one is
 
 ## [Unreleased]
 
+## [4.0.2] — 2026-10-13
+
+### Changed
+
+- Update `vfs-kit` to v1.4.4, `metrics-kit/v3` to v3.0.2 and
+  `logger-kit/v3` to v3.0.2.
+- Expand cache, handler and validator regression coverage and reduce the
+  complexity of cache storage, request handling, lookup and origin checks.
+
+### Fixed
+
+- Honor case-insensitive and repeated Cache-Control fields, explicit zero
+  freshness and the distinction between shared and private cache policies.
+- Accept only successful, uncanceled 304 responses for revalidation and
+  preserve representation metadata when merging updated response headers.
+- Remove transient 1xx Warning values after successful revalidation while
+  retaining persistent warnings.
+
 ## [4.0.0] — 2026-09-21
 
 ### Changed — BREAKING

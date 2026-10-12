@@ -242,7 +242,9 @@ func (r *Resource) MaxAge(shared bool) (time.Duration, error) {
 	if expiresVal := r.header.Get("Expires"); expiresVal != "" {
 		expires, err := http.ParseTime(expiresVal)
 		if err != nil {
-			return time.Duration(0), err
+			// RFC 9111 section 5.3 treats invalid Expires values as already
+			// expired. A validator can still make this stale response storable.
+			return 0, nil
 		}
 		date, dateErr := timeHeader("Date", r.header)
 		if dateErr != nil {

@@ -1,11 +1,11 @@
 # Go Report Card
 
-**Grade: A+** (98.9%)
+**Grade: A+** (100.0%)
 
 | Metric | Value |
 | ------ | ----- |
-| Files | 33 |
-| Issues | 3 |
+| Files | 41 |
+| Issues | 0 |
 
 ## Checks
 
@@ -13,24 +13,12 @@
 | ----- | ----- |
 | gofmt | 100% |
 | go_vet | 100% |
-| gocyclo | 90% |
+| gocyclo | 100% |
 | ineffassign | 100% |
 | license | 100% |
 | misspell | 100% |
 
-## Issues
-
-### gocyclo
-
-- `cache.go`
-  - Line 597: cyclomatic complexity 23 for function (*cache).Store
-- `invalidate_internal_test.go`
-  - Line 1365: cyclomatic complexity 21 for function TestValidationRefetchesWhenInvalidatedDuringFreshen
-- `handler.go`
-  - Line 191: cyclomatic complexity 24 for function (*Handler).ServeHTTP
-  - Line 1135: cyclomatic complexity 23 for function (*cacheRequest).sameOriginURL
-  - Line 661: cyclomatic complexity 22 for function (*Handler).isCacheable
-  - Line 1005: cyclomatic complexity 16 for function (*Handler).lookup
+No issues found. Nice work!
 
 ---
 
