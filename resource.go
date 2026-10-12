@@ -239,7 +239,7 @@ func (r *Resource) MaxAge(shared bool) (time.Duration, error) {
 		return cc.Duration("max-age")
 	}
 
-	if expiresVal := r.header.Get("Expires"); expiresVal != "" {
+	if expiresVal, present := r.expiresValue(); present {
 		expires, err := http.ParseTime(expiresVal)
 		if err != nil {
 			// RFC 9111 section 5.3 treats invalid Expires values as already
@@ -257,6 +257,15 @@ func (r *Resource) MaxAge(shared bool) (time.Duration, error) {
 	}
 
 	return time.Duration(0), nil
+}
+
+func (r *Resource) expiresValue() (string, bool) {
+	for name := range r.header {
+		if strings.EqualFold(name, "Expires") {
+			return combinedHeaderValues(r.header, "Expires"), true
+		}
+	}
+	return "", false
 }
 
 func (r *Resource) RemovePrivateHeaders() {
@@ -300,11 +309,8 @@ func (r *Resource) hasExplicitExpiration(shared bool) bool {
 		return true
 	}
 
-	if r.header.Get("Expires") != "" {
-		return true
-	}
-
-	return false
+	_, present := r.expiresValue()
+	return present
 }
 
 func (r *Resource) HeuristicFreshness() time.Duration {

@@ -53,6 +53,13 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 		return applyValidationResponse(req.Request, res, exchange.status, exchange.snapshot, start), false
 	}
 	if retryOriginalPreconditions(exchange.status, req.Request, out) {
+		// The rewritten validator did not establish that the stored body is
+		// current. Retrying the client's validator can return 304 for a newer
+		// representation, which cannot refresh our older body. Fence the old
+		// generation before that retry so later readers must validate it too.
+		keys := req.validationKeys()
+		h.recordStale(keys...)
+		h.cache.Invalidate(keys...)
 		// Error responses can omit representation validators, so the delivery
 		// wrapper cannot reconstruct the result of the original conditions.
 		// Closing the pipe also releases a producer blocked on the error body.
