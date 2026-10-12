@@ -289,10 +289,11 @@ type generationReadFile struct {
 	owner *generationReadVFS
 }
 
-func (f *generationReadFile) Close() error {
+func (f *generationReadFile) Stat() (os.FileInfo, error) {
+	info, err := f.RFile.(interface{ Stat() (os.FileInfo, error) }).Stat()
 	close(f.owner.entered)
 	<-f.owner.release
-	return f.RFile.Close()
+	return info, err
 }
 
 func generationAwait(t *testing.T, event <-chan struct{}, description string) {

@@ -43,6 +43,7 @@ type Resource struct {
 	storedAt          time.Time
 	storedKey         string // exact entry generation retrieved, excluding a Vary discovery base
 	storageGeneration *cacheGeneration
+	storageRecord     *headerProvenance
 	handlerStoredAt   time.Time // opaque-cache evidence captured with this retrieval
 }
 

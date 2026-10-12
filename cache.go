@@ -661,14 +661,32 @@ func (c *cache) readHeaderRecord(path, key string) (Header, time.Time, *integrit
 }
 
 func (c *cache) readHeaderRecordWithKeyCheck(path, key string, checkKey bool) (Header, time.Time, *integrityRecord, error) {
+	h, at, meta, _, err := c.readHeaderProvenance(path, key, checkKey, false)
+	return h, at, meta, err
+}
+
+// The exact persisted record supplements the process-local ledger identity.
+// Another coordinated cache instance cannot update this instance's ledger.
+type headerProvenance struct {
+	fileInfo    os.FileInfo
+	fingerprint string
+	file        vfs.RFile
+}
+
+func (c *cache) readHeaderProvenance(path, key string, checkKey, retainFile bool) (Header, time.Time, *integrityRecord, *headerProvenance, error) {
 	f, err := c.fs.Open(path)
 	if err != nil {
 		if vfs.IsNotExist(err) {
-			return Header{}, time.Time{}, nil, ErrNotFoundInCache
+			return Header{}, time.Time{}, nil, nil, ErrNotFoundInCache
 		}
-		return Header{}, time.Time{}, nil, fmt.Errorf("failed to open header file %q for key %q: %w", path, key, err)
+		return Header{}, time.Time{}, nil, nil, fmt.Errorf("failed to open header file %q for key %q: %w", path, key, err)
 	}
-	defer func() { _ = f.Close() }()
+	retained := false
+	defer func() {
+		if !retained {
+			_ = f.Close()
+		}
+	}()
 
 	// Read the record whole. Headers are small, and completeness has to be
 	// judged before parsing: a partial record can parse into a plain error
@@ -676,7 +694,7 @@ func (c *cache) readHeaderRecordWithKeyCheck(path, key string, checkKey bool) (H
 	// from corruption once the bytes are gone.
 	raw, err := io.ReadAll(f)
 	if err != nil {
-		return Header{}, time.Time{}, nil, fmt.Errorf("failed to read header file %q for key %q: %w", path, key, err)
+		return Header{}, time.Time{}, nil, nil, fmt.Errorf("failed to read header file %q for key %q: %w", path, key, err)
 	}
 
 	// The header file is this entry's commit marker. Store writes the body in
@@ -696,7 +714,7 @@ func (c *cache) readHeaderRecordWithKeyCheck(path, key string, checkKey bool) (H
 	// resource whenever two requests for the same uncached URL overlapped,
 	// which is the ordinary case for a shared cache.
 	if !bytes.HasSuffix(raw, []byte(headerRecordTerminator)) {
-		return Header{}, time.Time{}, nil, ErrNotFoundInCache
+		return Header{}, time.Time{}, nil, nil, ErrNotFoundInCache
 	}
 
 	var meta *integrityRecord
@@ -706,19 +724,39 @@ func (c *cache) readHeaderRecordWithKeyCheck(path, key string, checkKey bool) (H
 		meta, err = decodeIntegrityRecord(raw, key, c.config.Integrity != IntegrityDisabled, false)
 	}
 	if err != nil {
-		return Header{}, time.Time{}, nil, err
+		return Header{}, time.Time{}, nil, nil, err
 	}
 	h, storedAt, err := readStoredHeaders(bufio.NewReader(bytes.NewReader(raw)))
 	if err != nil {
 		// The record is terminated, so this is a complete header that does not
 		// parse: corruption, not a write in flight.
 		if meta != nil {
-			return Header{}, time.Time{}, nil, &corruptEntryError{fingerprint: meta.fingerprint, reason: "invalid HTTP header record"}
+			return Header{}, time.Time{}, nil, nil, &corruptEntryError{fingerprint: meta.fingerprint, reason: "invalid HTTP header record"}
 		}
-		return Header{}, time.Time{}, nil, fmt.Errorf("failed to read headers from %q for key %q: %w", path, key, err)
+		return Header{}, time.Time{}, nil, nil, fmt.Errorf("failed to read headers from %q for key %q: %w", path, key, err)
 	}
 
-	return h, storedAt, meta, nil
+	proof := &headerProvenance{fingerprint: sha256Text(raw)}
+	if c.diskRoot != "" {
+		proof.fileInfo, err = c.headerFileInfo(f, path)
+		if err != nil {
+			return Header{}, time.Time{}, nil, nil, fmt.Errorf("failed to identify header for key %q: %w", key, err)
+		}
+		if retainFile {
+			proof.file = f
+			retained = true
+		}
+	}
+	return h, storedAt, meta, proof, nil
+}
+
+func (c *cache) headerFileInfo(f vfs.RFile, path string) (os.FileInfo, error) {
+	if stat, ok := f.(interface{ Stat() (os.FileInfo, error) }); ok {
+		return stat.Stat()
+	}
+	// VFS decorators can hide the opened native file's Stat method. Native
+	// callers coordinate publication while this record is being retrieved.
+	return c.fs.Stat(path)
 }
 
 // Store a resource against a number of keys. Resource bodies are streamed
@@ -1080,7 +1118,7 @@ func (c *cache) retrieve(key string, record bool) (*Resource, error) {
 		}
 		return nil, fmt.Errorf("failed to open body file %q for key %q: %w", bodyPath, key, err)
 	}
-	h, persistedAt, meta, err := c.readHeaderRecord(headerPrefix+formatPrefix+hashedKey, key)
+	h, persistedAt, meta, proof, err := c.readHeaderProvenance(headerPrefix+formatPrefix+hashedKey, key, true, true)
 	if err != nil {
 		_ = f.Close()
 		if err == ErrNotFoundInCache {
@@ -1090,6 +1128,9 @@ func (c *cache) retrieve(key string, record bool) (*Resource, error) {
 			return nil, ErrNotFoundInCache
 		}
 		return nil, fmt.Errorf("failed to retrieve header for key %q: %w", key, err)
+	}
+	if proof.file != nil {
+		f = &headerRetainingBody{ReadSeekCloser: f, header: proof.file}
 	}
 	if meta != nil {
 		if err := verifyStoredBody(f, meta, meta.fingerprint); err != nil {
@@ -1104,6 +1145,7 @@ func (c *cache) retrieve(key string, record bool) (*Resource, error) {
 	res.SetStoredAt(persistedAt)
 	res.storedKey = key
 	res.storageGeneration = storedGeneration
+	res.storageRecord = proof
 
 	// Check stale map with proper locking
 	c.staleMutex.RLock()
@@ -1409,7 +1451,7 @@ func (c *cache) freshenResourceForKey(res *Resource, key string) (bool, error) {
 	defer unlock()
 	c.beginReservation(hashedKey)
 	defer c.releaseReservation(hashedKey)
-	h, storedAt, meta, err := c.readHeaderRecord(headerPrefix+formatPrefix+hashedKey, key)
+	h, storedAt, meta, proof, err := c.readHeaderProvenance(headerPrefix+formatPrefix+hashedKey, key, true, false)
 	if err != nil {
 		// A newly fetched HEAD has nothing to freshen if no GET is stored.
 		if errors.Is(err, ErrNotFoundInCache) && res.storedAt.IsZero() {
@@ -1423,8 +1465,9 @@ func (c *cache) freshenResourceForKey(res *Resource, key string) (bool, error) {
 	// A Resource retrieved before a replacement cannot refresh that newer
 	// generation even if its weak validators or content length still match.
 	// Freshly fetched HEAD resources have no stored generation. Legacy
-	// resources retain the timestamp fallback for compatibility.
-	if c.resourceWasReplaced(res, hashedKey, storedAt) {
+	// resources retain the timestamp fallback for compatibility. Persisted
+	// provenance also catches replacements made by another coordinated cache.
+	if c.resourceWasReplaced(res, hashedKey, storedAt, proof) {
 		return false, fmt.Errorf("freshening target %q was replaced after retrieval", key)
 	}
 	if h.StatusCode != res.Status() || !headersEqual(h.Header, res.Header()) {
@@ -1453,14 +1496,24 @@ func (c *cache) freshenResourceForKey(res *Resource, key string) (bool, error) {
 	if res.storageGeneration != nil {
 		res.storageGeneration = c.entryGeneration(hashedKey)
 	}
+	if err := c.advanceResourceProvenance(res, key, headerData, freshenedAt); err != nil {
+		return false, err
+	}
 	return false, nil
 }
 
-func (c *cache) resourceWasReplaced(res *Resource, hashedKey string, storedAt time.Time) bool {
-	if res.storageGeneration != nil {
-		return res.storageGeneration != c.entryGeneration(hashedKey)
+func (c *cache) resourceWasReplaced(res *Resource, hashedKey string, storedAt time.Time, proof *headerProvenance) bool {
+	if res.storageGeneration != nil && res.storageGeneration != c.entryGeneration(hashedKey) {
+		return true
 	}
-	return !res.storedAt.IsZero() && storedAt.After(res.storedAt)
+	if !res.storedAt.IsZero() && !storedAt.Equal(res.storedAt) {
+		return true
+	}
+	if previous := res.storageRecord; previous != nil {
+		return previous.fingerprint != proof.fingerprint ||
+			(previous.fileInfo != nil && proof.fileInfo != nil && !os.SameFile(previous.fileInfo, proof.fileInfo))
+	}
+	return false
 }
 
 // Called while the key writer lock and capacity reservation remain held.
