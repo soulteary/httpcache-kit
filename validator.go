@@ -58,7 +58,20 @@ func (v *Validator) Validate(req *http.Request, res *Resource) bool {
 	merged := resHeaders.Clone()
 	merged.Del("Age")
 	for name, values := range responseHeaders {
+		if name == "Warning" {
+			continue
+		}
 		merged[name] = append([]string(nil), values...)
+	}
+	// RFC 7234 section 4.3.4 requires successful validation to discard 1xx
+	// warnings and retain stored 2xx warnings. Unlike other metadata, new
+	// Warning values supplement the retained values rather than replace them.
+	warnings := append([]string(nil), resHeaders.Values("Warning")...)
+	warnings = append(warnings, responseHeaders.Values("Warning")...)
+	if warnings = validatedWarningValues(warnings); len(warnings) > 0 {
+		merged["Warning"] = warnings
+	} else {
+		merged.Del("Warning")
 	}
 	if responseHeaders.Get("Date") == "" {
 		merged.Set("Date", Clock().Format(http.TimeFormat))
@@ -75,6 +88,53 @@ func (v *Validator) Validate(req *http.Request, res *Resource) bool {
 	// than treating its later header write as a newer representation.
 	res.RequestTime = t
 	return true
+}
+
+// Warning is a comma-separated list, but both its quoted text and optional
+// quoted HTTP-date can contain commas. Honor quoted-pair escapes while finding
+// list boundaries so retaining a 2xx value never changes its quoted content.
+func validatedWarningValues(fields []string) []string {
+	var result []string
+	seen := make(map[string]struct{})
+	for _, field := range fields {
+		var retained []string
+		keep := func(value string) {
+			value = strings.Trim(value, " \t")
+			if value == "" {
+				return
+			}
+			if len(value) >= 4 && value[0] == '1' && value[1] >= '0' && value[1] <= '9' &&
+				value[2] >= '0' && value[2] <= '9' && (value[3] == ' ' || value[3] == '\t') {
+				return
+			}
+			// A 304 may repeat the same persistent warning on every validation.
+			// Keep its first occurrence without growing the stored header forever.
+			if _, exists := seen[value]; exists {
+				return
+			}
+			seen[value] = struct{}{}
+			retained = append(retained, value)
+		}
+		start, quoted, escaped := 0, false, false
+		for i := 0; i < len(field); i++ {
+			switch {
+			case escaped:
+				escaped = false
+			case quoted && field[i] == '\\':
+				escaped = true
+			case field[i] == '"':
+				quoted = !quoted
+			case field[i] == ',' && !quoted:
+				keep(field[start:i])
+				start = i + 1
+			}
+		}
+		keep(field[start:])
+		if len(retained) > 0 {
+			result = append(result, strings.Join(retained, ", "))
+		}
+	}
+	return result
 }
 
 // Embedding handlers may assign raw map keys rather than using Header.Set.
