@@ -6,7 +6,7 @@ require (
 	github.com/prometheus/client_golang v1.25.0
 	github.com/soulteary/logger-kit/v3 v3.0.2
 	github.com/soulteary/metrics-kit/v3 v3.0.2
-	github.com/soulteary/vfs-kit v1.4.5-0.20261012210923-af6413b52e5b
+	github.com/soulteary/vfs-kit v1.4.5
 )
 
 require (

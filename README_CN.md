@@ -50,7 +50,7 @@ import (
     "net/http"
     "net/http/httputil"
 
-    httpcache "github.com/soulteary/httpcache-kit/v3"
+    httpcache "github.com/soulteary/httpcache-kit/v4"
 )
 
 func main() {

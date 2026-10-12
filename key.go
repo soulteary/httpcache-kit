@@ -65,10 +65,21 @@ func (k Key) Vary(varyHeader string, r *http.Request) Key {
 // same key string as a different URL carrying Vary values.
 const varySeparator = "\x1f"
 
+// Version varied keys outside the legacy key namespace, rather than inside a
+// field value that an old request could reproduce. A legal HTTP method cannot
+// start with a unit separator, so no old method/URL/header combination can
+// produce this prefix. Non-varied discovery keys keep their existing encoding.
+const varyKeyNamespace = "\x1fHTTPCACHE-VARY/2\x1f"
+
 func (k Key) String() string {
 	URL := canonicalURL(&k.u).String()
+	namespace := ""
+	if len(k.vary) != 0 {
+		namespace = varyKeyNamespace
+	}
 	var b strings.Builder
-	b.Grow(len(k.method) + 1 + len(URL) + 3 + 10*len(k.vary)) // heuristic to reduce allocs
+	b.Grow(len(namespace) + len(k.method) + 1 + len(URL) + 3 + 10*len(k.vary)) // heuristic to reduce allocs
+	b.WriteString(namespace)
 	b.WriteString(k.method)
 	b.WriteString(":")
 	b.WriteString(URL)
