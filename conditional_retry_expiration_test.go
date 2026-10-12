@@ -18,44 +18,7 @@ func TestConditionalUnsatisfiableRangeRetriesOriginalClientRequest(t *testing.T)
 			cache := NewMemoryCache().(ExtendedCache)
 			defer func() { _ = cache.Close() }()
 			current := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
-			h := NewSharedHandler(cache, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				n := calls.Add(1)
-				w.Header().Set("Cache-Control", "max-age=3600")
-				body, modified := "long old representation", current.Add(-time.Hour)
-				if n == 1 {
-					if condition != "date" {
-						w.Header().Set("ETag", `"old"`)
-					}
-				} else {
-					body, modified = "new", current
-					if condition != "date" {
-						w.Header().Set("ETag", `"current"`)
-					}
-					if (n == 2 || n == 3) && r.Header.Get("Range") != "bytes=10-12" {
-						t.Error("retry lost original Range")
-					}
-					switch n {
-					case 2:
-						if condition != "date" && r.Header.Get("If-None-Match") != `"old"` {
-							t.Error("validation did not use cached ETag")
-						}
-						if condition == "date" && r.Header.Get("If-Modified-Since") != current.Add(-time.Hour).Format(http.TimeFormat) {
-							t.Error("validation did not use cached modification date")
-						}
-					case 3:
-						if condition == "etag-cache-date-client" && r.Header.Get("If-None-Match") != "" {
-							t.Error("retry retained the cache ETag ahead of the client's date")
-						}
-						if condition == "etag" && r.Header.Get("If-None-Match") != `"current"` {
-							t.Error("retry did not restore original client ETag")
-						}
-						if condition != "etag" && r.Header.Get("If-Modified-Since") != current.Format(http.TimeFormat) {
-							t.Error("retry did not restore original client modification date")
-						}
-					}
-				}
-				http.ServeContent(w, r, "", modified, strings.NewReader(body))
-			}))
+			h := NewSharedHandler(cache, conditionalRetryOrigin(t, &calls, current, condition))
 			defer func() { _ = h.Shutdown(context.Background()) }()
 			server := httptest.NewServer(h)
 			defer server.Close()
@@ -94,19 +57,76 @@ func TestConditionalUnsatisfiableRangeRetriesOriginalClientRequest(t *testing.T)
 			if !cached.IsStale() {
 				t.Fatal("failed validation left the old representation fresh")
 			}
-			for range 2 {
-				res, err = http.Get(server.URL)
-				if err != nil {
-					t.Fatal(err)
-				}
-				body, err = io.ReadAll(res.Body)
-				_ = res.Body.Close()
-				h.writes.Wait()
-				if err != nil || res.StatusCode != 200 || string(body) != "new" || calls.Load() != 4 {
-					t.Fatalf("old body reused after client 304: status=%d body=%q calls=%d err=%v", res.StatusCode, body, calls.Load(), err)
-				}
-			}
+			assertConditionalRetryFreshRepresentation(t, h, server.URL, &calls)
 		})
+	}
+}
+
+func conditionalRetryOrigin(t *testing.T, calls *atomic.Int64, current time.Time, condition string) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		w.Header().Set("Cache-Control", "max-age=3600")
+		body, modified := "long old representation", current.Add(-time.Hour)
+		if n == 1 {
+			if condition != "date" {
+				w.Header().Set("ETag", `"old"`)
+			}
+		} else {
+			body, modified = "new", current
+			if condition != "date" {
+				w.Header().Set("ETag", `"current"`)
+			}
+			if (n == 2 || n == 3) && r.Header.Get("Range") != "bytes=10-12" {
+				t.Error("retry lost original Range")
+			}
+			switch n {
+			case 2:
+				assertConditionalRetryValidation(t, r, current, condition)
+			case 3:
+				assertConditionalRetryOriginal(t, r, current, condition)
+			}
+		}
+		http.ServeContent(w, r, "", modified, strings.NewReader(body))
+	})
+}
+
+func assertConditionalRetryValidation(t *testing.T, r *http.Request, current time.Time, condition string) {
+	t.Helper()
+	if condition != "date" && r.Header.Get("If-None-Match") != `"old"` {
+		t.Error("validation did not use cached ETag")
+	}
+	if condition == "date" && r.Header.Get("If-Modified-Since") != current.Add(-time.Hour).Format(http.TimeFormat) {
+		t.Error("validation did not use cached modification date")
+	}
+}
+
+func assertConditionalRetryOriginal(t *testing.T, r *http.Request, current time.Time, condition string) {
+	t.Helper()
+	if condition == "etag-cache-date-client" && r.Header.Get("If-None-Match") != "" {
+		t.Error("retry retained the cache ETag ahead of the client's date")
+	}
+	if condition == "etag" && r.Header.Get("If-None-Match") != `"current"` {
+		t.Error("retry did not restore original client ETag")
+	}
+	if condition != "etag" && r.Header.Get("If-Modified-Since") != current.Format(http.TimeFormat) {
+		t.Error("retry did not restore original client modification date")
+	}
+}
+
+func assertConditionalRetryFreshRepresentation(t *testing.T, h *Handler, url string, calls *atomic.Int64) {
+	t.Helper()
+	for range 2 {
+		res, err := http.Get(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		h.writes.Wait()
+		if err != nil || res.StatusCode != 200 || string(body) != "new" || calls.Load() != 4 {
+			t.Fatalf("old body reused after client 304: status=%d body=%q calls=%d err=%v", res.StatusCode, body, calls.Load(), err)
+		}
 	}
 }
 
@@ -145,22 +165,7 @@ func TestMalformedExpiresKeepsStaleValidatorsForRevalidation(t *testing.T) {
 				cache := NewMemoryCache().(ExtendedCache)
 				defer func() { _ = cache.Close() }()
 				modified := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Second).Format(http.TimeFormat)
-				h := NewSharedHandler(cache, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					w.Header().Set("Expires", expires)
-					switch validator {
-					case "etag":
-						w.Header().Set("ETag", `"same"`)
-					case "last-modified":
-						w.Header().Set("Last-Modified", modified)
-					}
-					if r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Modified-Since") != "" {
-						validations.Add(1)
-						w.WriteHeader(http.StatusNotModified)
-						return
-					}
-					full.Add(1)
-					_, _ = io.WriteString(w, "complete")
-				}))
+				h := NewSharedHandler(cache, conditionalExpirationOrigin(expires, validator, modified, &full, &validations))
 				defer h.writes.Wait()
 				for range 3 {
 					w := httptest.NewRecorder()
@@ -180,4 +185,23 @@ func TestMalformedExpiresKeepsStaleValidatorsForRevalidation(t *testing.T) {
 			})
 		}
 	}
+}
+
+func conditionalExpirationOrigin(expires, validator, modified string, full, validations *atomic.Int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Expires", expires)
+		switch validator {
+		case "etag":
+			w.Header().Set("ETag", `"same"`)
+		case "last-modified":
+			w.Header().Set("Last-Modified", modified)
+		}
+		if r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Modified-Since") != "" {
+			validations.Add(1)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		full.Add(1)
+		_, _ = io.WriteString(w, "complete")
+	})
 }

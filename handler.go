@@ -337,7 +337,8 @@ func (h *Handler) validateCachedResponse(rw http.ResponseWriter, cReq *cacheRequ
 	}
 	h.debugf("response is valid")
 	keys := cReq.validationKeys()
-	if !h.isCacheable(res, cReq) || !sameVaryFields(previousVary, combinedHeaderValues(res.Header(), "Vary")) {
+	varyChanged := !sameVaryFields(previousVary, combinedHeaderValues(res.Header(), "Vary"))
+	if !h.isCacheable(res, cReq) || varyChanged {
 		// A 304 can withdraw permission to reuse the stored response. Do not
 		// freshen a formerly public object or leave the old policy available.
 		// A changed Vary field set also needs a full Store to rebuild both the
@@ -345,7 +346,11 @@ func (h *Handler) validateCachedResponse(rw http.ResponseWriter, cReq *cacheRequ
 		// if that refetch fails, rather than refreshing the old selection rule.
 		h.recordStale(keys...)
 		h.cache.Invalidate(keys...)
-		h.refetchCachedResponse(rw, cReq, res)
+		if varyChanged {
+			h.refetchChangedVaryResponse(rw, cReq, res)
+		} else {
+			h.refetchCachedResponse(rw, cReq, res)
+		}
 		return false
 	}
 	if h.Shared {
@@ -381,6 +386,31 @@ func (cReq *cacheRequest) validationKeys() []string {
 func (h *Handler) refetchCachedResponse(rw http.ResponseWriter, cReq *cacheRequest, res *Resource) {
 	_ = res.Close()
 	h.passUpstream(rw, cReq, nil)
+}
+
+func (h *Handler) refetchChangedVaryResponse(rw http.ResponseWriter, cReq *cacheRequest, res *Resource) {
+	_ = res.Close()
+	// Rebuilding the index needs a body even when the client's validators
+	// match. Preserve other preconditions and Range at the origin, while the
+	// delivery writer applies the original matching conditions to the client.
+	fetch := cReq.Clone(cReq.Context())
+	fetch.Header.Del("If-None-Match")
+	fetch.Header.Del("If-Modified-Since")
+	client := newClientPreconditionWriter(rw, cReq.Request)
+	finished := make(chan struct{})
+	h.passUpstreamWithHandler(client, cReq, nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		defer close(finished)
+		h.upstream.ServeHTTP(w, fetch)
+	}), Clock())
+	// Main-path header updates must finish too: an empty uncacheable response
+	// can still be assigning X-Cache while the origin handler returns.
+	select {
+	case <-finished:
+		if finisher, ok := client.(interface{ finishTrailers() }); ok {
+			finisher.finishTrailers()
+		}
+	case <-cReq.Context().Done():
+	}
 }
 
 func (h *Handler) freshenValidatedResponse(res *Resource, keys []string) bool {

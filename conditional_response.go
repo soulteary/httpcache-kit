@@ -71,7 +71,9 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 		h.recordStale(keys...)
 		h.cache.Invalidate(keys...)
 	}
-	h.passUpstreamWithHandler(newClientPreconditionWriter(w, req.Request), req, nil, http.HandlerFunc(func(dst http.ResponseWriter, _ *http.Request) {
+	client := newClientPreconditionWriter(w, req.Request)
+	copied := make(chan bool, 1)
+	h.passUpstreamWithHandler(client, req, nil, http.HandlerFunc(func(dst http.ResponseWriter, _ *http.Request) {
 		for name, values := range exchange.snapshot {
 			dst.Header()[name] = append([]string(nil), values...)
 		}
@@ -80,16 +82,30 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 			if stream, ok := dst.(*responseStreamer); ok {
 				_ = stream.pipeWriter.CloseWithError(err)
 			}
-		} else {
-			copyValidationTrailers(dst.Header(), exchange.header, exchange.snapshot)
-			if stream, ok := dst.(*responseStreamer); ok {
-				if filtered, ok := stream.ResponseWriter.(interface{ finishTrailers() }); ok {
-					filtered.finishTrailers()
-				}
-			}
+			copied <- false
+			return
 		}
+		copied <- true
 	}), start)
+	finishValidationTrailers(req.Context(), client, exchange, copied)
 	return false, true
+}
+
+func finishValidationTrailers(ctx context.Context, client http.ResponseWriter, exchange *validationExchange, copied <-chan bool) {
+	// An uncacheable response can update X-Cache after publishing its initial
+	// headers. Publish final trailers only after both the copy and that main
+	// path have finished, so they never read or write the header map together.
+	select {
+	case complete := <-copied:
+		if !complete {
+			return
+		}
+		copyValidationTrailers(client.Header(), exchange.header, exchange.snapshot)
+		if filtered, ok := client.(interface{ finishTrailers() }); ok {
+			filtered.finishTrailers()
+		}
+	case <-ctx.Done():
+	}
 }
 
 func retryOriginalPreconditions(status int, original, validation *http.Request) bool {

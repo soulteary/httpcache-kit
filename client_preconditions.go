@@ -7,7 +7,8 @@ import (
 
 // Validation uses the cache's validator. Delivery must still apply the client's
 // original preconditions to the new representation, while storage receives the
-// complete 200 body. ServeContent supplies the same ETag/date semantics as hits.
+// complete representation. ServeContent supplies the same ETag/date semantics
+// as hits, including for successful responses without content.
 type clientPreconditionWriter struct {
 	http.ResponseWriter
 	req      *http.Request
@@ -24,10 +25,10 @@ func newClientPreconditionWriter(w http.ResponseWriter, req *http.Request) http.
 func (w *clientPreconditionWriter) Header() http.Header { return w.header }
 func (w *clientPreconditionWriter) WriteHeader(status int) {
 	header := w.header
-	// Successful representations, including transformed 203 responses, can
-	// satisfy the original conditions. Redirects and errors take precedence
-	// (RFC 9110 section 13.2.1), even when they carry matching validators.
-	if status == http.StatusOK || status == http.StatusNonAuthoritativeInfo || status == http.StatusPartialContent {
+	// Evaluate the client's conditions for every successful response, including
+	// bodyless 204/205 responses. Redirects and errors take precedence (RFC 9110
+	// section 13.2.1), even when they carry matching validators.
+	if status >= http.StatusOK && status < http.StatusMultipleChoices {
 		probe := &preconditionProbe{header: header.Clone()}
 		req := w.req.Clone(w.req.Context())
 		req.Header.Del("Range") // The upstream has already applied the range.
