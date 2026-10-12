@@ -130,21 +130,7 @@ func TestRejectedValidationPreservesWarningMetadata(t *testing.T) {
 func TestShared304WarningCleanupPersists(t *testing.T) {
 	for _, backend := range []string{"memory", "disk"} {
 		t.Run(backend, func(t *testing.T) {
-			var cache ExtendedCache
-			if backend == "memory" {
-				cache = NewMemoryCache().(ExtendedCache)
-			} else {
-				var err error
-				cache, err = NewDiskCacheWithConfig(t.TempDir(), nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-			defer func() {
-				if err := cache.Close(); err != nil {
-					t.Error(err)
-				}
-			}()
+			cache := newRegressionTestCache(t, backend)
 			var hits atomic.Int64
 			retained := `214 proxy "Transformed, persistently"`
 			added := `299 proxy "Persistent, new"`

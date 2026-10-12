@@ -98,43 +98,48 @@ func validatedWarningValues(fields []string) []string {
 	seen := make(map[string]struct{})
 	for _, field := range fields {
 		var retained []string
-		keep := func(value string) {
+		for _, value := range splitWarningValues(field) {
 			value = strings.Trim(value, " \t")
-			if value == "" {
-				return
-			}
-			if len(value) >= 4 && value[0] == '1' && value[1] >= '0' && value[1] <= '9' &&
-				value[2] >= '0' && value[2] <= '9' && (value[3] == ' ' || value[3] == '\t') {
-				return
+			if value == "" || isTransientWarning(value) {
+				continue
 			}
 			// A 304 may repeat the same persistent warning on every validation.
 			// Keep its first occurrence without growing the stored header forever.
 			if _, exists := seen[value]; exists {
-				return
+				continue
 			}
 			seen[value] = struct{}{}
 			retained = append(retained, value)
 		}
-		start, quoted, escaped := 0, false, false
-		for i := 0; i < len(field); i++ {
-			switch {
-			case escaped:
-				escaped = false
-			case quoted && field[i] == '\\':
-				escaped = true
-			case field[i] == '"':
-				quoted = !quoted
-			case field[i] == ',' && !quoted:
-				keep(field[start:i])
-				start = i + 1
-			}
-		}
-		keep(field[start:])
 		if len(retained) > 0 {
 			result = append(result, strings.Join(retained, ", "))
 		}
 	}
 	return result
+}
+
+func isTransientWarning(value string) bool {
+	return len(value) >= 4 && value[0] == '1' && value[1] >= '0' && value[1] <= '9' &&
+		value[2] >= '0' && value[2] <= '9' && (value[3] == ' ' || value[3] == '\t')
+}
+
+func splitWarningValues(field string) []string {
+	var values []string
+	start, quoted, escaped := 0, false, false
+	for i := 0; i < len(field); i++ {
+		switch {
+		case escaped:
+			escaped = false
+		case quoted && field[i] == '\\':
+			escaped = true
+		case field[i] == '"':
+			quoted = !quoted
+		case field[i] == ',' && !quoted:
+			values = append(values, field[start:i])
+			start = i + 1
+		}
+	}
+	return append(values, field[start:])
 }
 
 // Embedding handlers may assign raw map keys rather than using Header.Set.

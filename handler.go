@@ -213,137 +213,156 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheType := "private"
-	if h.Shared {
-		cacheType = "shared"
-	}
-
 	if err == ErrNotFoundInCache {
-		if cReq.CacheControl.Has("only-if-cached") {
-			http.Error(rw, "key not in cache",
-				http.StatusGatewayTimeout)
-			return
-		}
-		h.debugf("%s %s not in %s cache", r.Method, r.URL.String(), cacheType)
-		if h.metrics != nil {
-			h.metricsRef().RecordCacheMiss(r.Method)
-		}
-		flight, leader := h.claimMiss(cReq.Key.String())
-		if leader {
-			h.passUpstream(rw, cReq, func() { h.finishMiss(cReq.Key.String(), flight) })
-			return
-		}
-
-		select {
-		case <-flight.done:
-			res, err = h.lookup(cReq)
-			if err != nil {
-				// The leader could not cache the response. Fall through to an
-				// uncoupled upstream request so followers are never stranded.
-				h.passUpstream(rw, cReq, nil)
-				return
-			}
-			// Continue through the ordinary cache-hit path. Invalidation may
-			// race the leader's completed Store and mark this response stale
-			// before the follower wakes, so it must not bypass validation.
-		case <-r.Context().Done():
+		var found bool
+		res, found = h.resolveMiss(rw, cReq)
+		if !found {
 			return
 		}
 	}
 
-	h.debugf("%s %s found in %s cache", r.Method, r.URL.String(), cacheType)
+	h.serveCachedResponse(rw, cReq, res)
+}
 
-	if h.needsValidation(res, cReq) {
-		if cReq.CacheControl.Has("only-if-cached") {
-			// res came from the cache and is not served; both early returns
-			// in this block leave it open otherwise, and the disk backend
-			// holds a file descriptor per retrieved resource. Every stale
-			// entry lacking a validator took one on each refresh.
-			_ = res.Close()
-			http.Error(rw, "key was in cache, but required validation",
-				http.StatusGatewayTimeout)
-			return
-		}
+func (h *Handler) cacheType() string {
+	if h.Shared {
+		return "shared"
+	}
+	return "private"
+}
 
-		h.debugf("validating cached response")
-		if h.validator.Validate(r, res) {
-			h.debugf("response is valid")
-			// Both the base key and the VARIANT that was actually retrieved.
-			// Freshening only the base left the variant's stored Proxy-Date
-			// older than the base marker, so it was marked stale again on the
-			// very next request and revalidated upstream every time until the
-			// marker was swept.
-			keys := []string{cReq.Key.String()}
-			if cReq.servedKey != "" && cReq.servedKey != keys[0] {
-				keys = append(keys, cReq.servedKey)
-			}
-			if !h.isCacheable(res, cReq) {
-				// A 304 can withdraw permission to reuse the stored response.
-				// Do not freshen a formerly public object after no-store/private
-				// metadata arrives, or leave the old policy available to later hits.
-				h.recordStale(keys...)
-				h.cache.Invalidate(keys...)
-				_ = res.Close()
-				h.passUpstream(rw, cReq, nil)
-				return
-			}
-			if h.Shared {
-				// Apply field-qualified private directives introduced by the 304
-				// before persisting or serving its merged metadata, just as Store
-				// does for a newly fetched representation.
-				res.RemovePrivateHeaders()
-			}
-			if err := h.cache.Freshen(res, keys...); err != nil {
-				// The validation may have raced a newer invalidation, or the
-				// cache may have failed to persist it. Serving the old body as a
-				// HIT would be unsafe; fetch the current representation in full.
-				h.debugf("freshening cached response failed: %v", err)
-				_ = res.Close()
-				h.passUpstream(rw, cReq, nil)
-				return
-			}
-			// Invalidate publishes its barrier before it waits for an active
-			// Freshen's generation read lock. The marker can therefore advance
-			// after Freshen's initial check but before its header write returns.
-			// Recheck the validation START time now; the later header timestamp
-			// is not proof that a request begun before that mutation is current.
-			for key, staleAt := range h.staleSnapshot(keys) {
-				if !res.ReceivedAfter(staleAt) {
-					h.debugf("validation for %q was superseded after freshening by invalidation at %s", key, staleAt)
-					_ = res.Close()
-					h.passUpstream(rw, cReq, nil)
-					return
-				}
-			}
-			// Validator records the precise instant at which the conditional
-			// request began. cReq.Time predates cache lookup and can therefore
-			// precede a concurrent mutation even though validation itself began
-			// after it.
-			h.recordFresh(res.RequestTime, keys...)
-			// lookup marked this in-memory Resource stale before validation.
-			// Freshen advances the persisted generation, but it cannot clear the
-			// flag on the object we are about to serve; do that only after the
-			// ordered Freshen succeeds so Warning: 110 is not emitted for a
-			// response just validated against the origin.
-			res.markFresh()
-		} else {
-			h.debugf("response is changed")
-			_ = res.Close()
+// resolveMiss serves an upstream response or waits for the current miss leader.
+// A true result is a cached resource that still needs the ordinary hit checks.
+func (h *Handler) resolveMiss(rw http.ResponseWriter, cReq *cacheRequest) (*Resource, bool) {
+	if cReq.CacheControl.Has("only-if-cached") {
+		http.Error(rw, "key not in cache", http.StatusGatewayTimeout)
+		return nil, false
+	}
+	h.debugf("%s %s not in %s cache", cReq.Method, cReq.URL.String(), h.cacheType())
+	if h.metrics != nil {
+		h.metricsRef().RecordCacheMiss(cReq.Method)
+	}
+	flight, leader := h.claimMiss(cReq.Key.String())
+	if leader {
+		h.passUpstream(rw, cReq, func() { h.finishMiss(cReq.Key.String(), flight) })
+		return nil, false
+	}
+
+	select {
+	case <-flight.done:
+		res, err := h.lookup(cReq)
+		if err != nil {
+			// The leader could not cache the response. Fall through to an
+			// uncoupled upstream request so followers are never stranded.
 			h.passUpstream(rw, cReq, nil)
-			return
+			return nil, false
 		}
+		// Invalidation may race the leader's completed Store and mark this
+		// response stale before the follower wakes. Do not bypass validation.
+		return res, true
+	case <-cReq.Context().Done():
+		return nil, false
+	}
+}
+
+func (h *Handler) serveCachedResponse(rw http.ResponseWriter, cReq *cacheRequest, res *Resource) {
+	h.debugf("%s %s found in %s cache", cReq.Method, cReq.URL.String(), h.cacheType())
+	if h.needsValidation(res, cReq) && !h.validateCachedResponse(rw, cReq, res) {
+		return
 	}
 
 	h.debugf("serving from cache")
 	res.Header().Set(CacheHeader, "HIT")
 	if h.metrics != nil {
-		h.metricsRef().RecordCacheHit(r.Method)
+		h.metricsRef().RecordCacheHit(cReq.Method)
 	}
 	h.serveResource(res, rw, cReq)
 
 	if err := res.Close(); err != nil {
 		h.errorf("Error closing resource: %s", err.Error())
 	}
+}
+
+// validateCachedResponse returns true only when res is safe to serve. Otherwise
+// it closes the retrieved resource and writes an error or a full refetch.
+func (h *Handler) validateCachedResponse(rw http.ResponseWriter, cReq *cacheRequest, res *Resource) bool {
+	if cReq.CacheControl.Has("only-if-cached") {
+		// The disk backend holds a file descriptor per retrieved resource;
+		// even entries that cannot be served must be closed on every refresh.
+		_ = res.Close()
+		http.Error(rw, "key was in cache, but required validation", http.StatusGatewayTimeout)
+		return false
+	}
+
+	h.debugf("validating cached response")
+	if !h.validator.Validate(cReq.Request, res) {
+		h.debugf("response is changed")
+		h.refetchCachedResponse(rw, cReq, res)
+		return false
+	}
+	h.debugf("response is valid")
+	keys := cReq.validationKeys()
+	if !h.isCacheable(res, cReq) {
+		// A 304 can withdraw permission to reuse the stored response. Do not
+		// freshen a formerly public object or leave the old policy available.
+		h.recordStale(keys...)
+		h.cache.Invalidate(keys...)
+		h.refetchCachedResponse(rw, cReq, res)
+		return false
+	}
+	if h.Shared {
+		// Apply field-qualified private directives introduced by the 304
+		// before persisting or serving its merged metadata, just as Store does.
+		res.RemovePrivateHeaders()
+	}
+	if !h.freshenValidatedResponse(res, keys) {
+		h.refetchCachedResponse(rw, cReq, res)
+		return false
+	}
+	return true
+}
+
+func (cReq *cacheRequest) validationKeys() []string {
+	// Freshen both the base key and the variant that lookup actually retrieved.
+	// Otherwise the variant's older Proxy-Date makes it stale again on every
+	// subsequent request until the base invalidation marker is swept.
+	keys := []string{cReq.Key.String()}
+	if cReq.servedKey != "" && cReq.servedKey != keys[0] {
+		keys = append(keys, cReq.servedKey)
+	}
+	return keys
+}
+
+func (h *Handler) refetchCachedResponse(rw http.ResponseWriter, cReq *cacheRequest, res *Resource) {
+	_ = res.Close()
+	h.passUpstream(rw, cReq, nil)
+}
+
+func (h *Handler) freshenValidatedResponse(res *Resource, keys []string) bool {
+	if err := h.cache.Freshen(res, keys...); err != nil {
+		// The validation may have raced a newer invalidation, or the cache may
+		// have failed to persist it. Fetch the current representation in full.
+		h.debugf("freshening cached response failed: %v", err)
+		return false
+	}
+	// Invalidate publishes its barrier before it waits for an active Freshen's
+	// generation read lock. The marker can advance after Freshen's initial
+	// check but before its header write returns. Recheck the validation START
+	// time; the later header timestamp cannot establish the response's currency.
+	for key, staleAt := range h.staleSnapshot(keys) {
+		if !res.ReceivedAfter(staleAt) {
+			h.debugf("validation for %q was superseded after freshening by invalidation at %s", key, staleAt)
+			return false
+		}
+	}
+	// Validator records when the conditional request began. cReq.Time predates
+	// lookup and can precede a mutation even if validation itself began after it.
+	h.recordFresh(res.RequestTime, keys...)
+	// Freshen advances the persisted generation, but cannot clear lookup's
+	// stale flag on this Resource. Clear it only after the ordered update so a
+	// successfully validated response does not carry Warning: 110.
+	res.markFresh()
+	return true
 }
 
 // freshness returns the duration that a requested resource will be fresh for
@@ -681,28 +700,7 @@ func (h *Handler) isCacheable(res *Resource, r *cacheRequest) bool {
 		return false
 	}
 
-	if cc.Has("no-cache") || cc.Has("no-store") {
-		return false
-	}
-	if varyWildcard(res.Header().Get("Vary")) {
-		return false
-	}
-
-	if cc.Has("private") && len(cc["private"]) == 0 && h.Shared {
-		return false
-	}
-
-	if _, ok := storeable[res.Status()]; !ok {
-		return false
-	}
-
-	if r.Header.Get("Authorization") != "" && h.Shared &&
-		!cc.Has("public") && !cc.Has("s-maxage") {
-		return false
-	}
-
-	if res.Header().Get("Authorization") != "" && h.Shared &&
-		!cc.Has("must-revalidate") && !cc.Has("s-maxage") {
+	if !h.allowsResponseStorage(res, r, cc) {
 		return false
 	}
 
@@ -718,13 +716,39 @@ func (h *Handler) isCacheable(res *Resource, r *cacheRequest) bool {
 		return false
 	}
 
-	if res.HasValidators() {
-		return true
-	} else if res.heuristicFreshness(h.Shared) > 0 {
-		return true
+	return res.HasValidators() || res.heuristicFreshness(h.Shared) > 0
+}
+
+// allowsResponseStorage checks restrictions independent of response freshness.
+func (h *Handler) allowsResponseStorage(res *Resource, r *cacheRequest, cc CacheControl) bool {
+	if cc.Has("no-cache") || cc.Has("no-store") {
+		return false
+	}
+	if varyWildcard(res.Header().Get("Vary")) {
+		return false
 	}
 
-	return false
+	if cc.Has("private") && len(cc["private"]) == 0 && h.Shared {
+		return false
+	}
+
+	if _, ok := storeable[res.Status()]; !ok {
+		return false
+	}
+
+	return h.allowsAuthenticatedStorage(res, r, cc)
+}
+
+func (h *Handler) allowsAuthenticatedStorage(res *Resource, r *cacheRequest, cc CacheControl) bool {
+	if !h.Shared {
+		return true
+	}
+	if r.Header.Get("Authorization") != "" &&
+		!cc.Has("public") && !cc.Has("s-maxage") {
+		return false
+	}
+
+	return res.Header().Get("Authorization") == "" || cc.Has("must-revalidate") || cc.Has("s-maxage")
 }
 
 func (h *Handler) serveResource(res *Resource, w http.ResponseWriter, req *cacheRequest) {
@@ -1023,6 +1047,27 @@ type staleSnapshotChecker interface {
 // lookupResource finds the best matching Resource for the
 // request, or nil and ErrNotFoundInCache if none is found
 func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
+	res, lookupKey, err := h.lookupBaseResource(req)
+	if err != nil {
+		return res, err
+	}
+	baseKey := lookupKey.String()
+
+	// A third-party Cache can complete a pre-mutation background Store after
+	// its own Invalidate call. The handler's generation record is what prevents
+	// that ordinary (non-Vary) base entry from being republished as a fresh HIT.
+	// Built-in caches reach the same conclusion through StoredAt/StaleAt, so the
+	// check is harmless for them as well.
+	h.markInvalidatedResource(res, baseKey, baseKey, false)
+
+	if vary := res.Header().Get("Vary"); vary != "" {
+		return h.lookupVaryResource(req, res, lookupKey, vary)
+	}
+	return res, nil
+}
+
+// lookupBaseResource also applies the narrower GET-to-HEAD fallback policy.
+func (h *Handler) lookupBaseResource(req *cacheRequest) (*Resource, Key, error) {
 	lookupKey := req.Key
 	baseKey := lookupKey.String()
 	res, err := h.cache.Retrieve(baseKey)
@@ -1033,7 +1078,7 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 		baseKey = lookupKey.String()
 		res, err = h.cache.Retrieve(baseKey)
 		if err != nil {
-			return nil, err
+			return nil, lookupKey, err
 		}
 
 		if res.hasExplicitExpiration(h.Shared) && req.isCacheable() {
@@ -1041,82 +1086,50 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 			req.servedKey = baseKey
 		} else {
 			_ = res.Close()
-			return nil, ErrNotFoundInCache
+			return nil, lookupKey, ErrNotFoundInCache
 		}
-	} else if err != nil {
-		return res, err
 	}
+	return res, lookupKey, err
+}
 
-	// A third-party Cache can complete a pre-mutation background Store after
-	// its own Invalidate call. The handler's generation record is what prevents
-	// that ordinary (non-Vary) base entry from being republished as a fresh HIT.
-	// Built-in caches reach the same conclusion through StoredAt/StaleAt, so the
-	// check is harmless for them as well.
+func (h *Handler) lookupVaryResource(req *cacheRequest, base *Resource, lookupKey Key, vary string) (*Resource, error) {
+	if varyWildcard(vary) {
+		_ = base.Close()
+		return nil, ErrNotFoundInCache
+	}
+	// Whether the BASE entry was invalidated, read before it is closed.
+	baseStale := base.IsStale()
+	baseKey := lookupKey.String()
+	variantKey := lookupKey.Vary(vary, req.Request).String()
+	varied, err := h.cache.Retrieve(variantKey)
+	// The primary entry is not the one we serve, and nothing else will
+	// close it. Releasing it here is what keeps the disk backend from
+	// leaking a file handle on every Vary lookup.
+	_ = base.Close()
+	if err != nil {
+		return varied, err
+	}
+	if varied != nil {
+		h.markInvalidatedResource(varied, variantKey, baseKey, baseStale)
+	}
+	req.servedKey = variantKey
+	return varied, nil
+}
+
+// markInvalidatedResource judges every Vary variant against the base key's
+// invalidation time. Refreshing one variant also replaces the base, and must
+// not accidentally make the other variants fresh again. Cache-provided markers
+// take precedence over the base entry's stale flag.
+func (h *Handler) markInvalidatedResource(res *Resource, resourceKey, baseKey string, baseStale bool) {
 	if staleAt, marked := h.staleAt(baseKey); marked {
-		if !h.resourceFreshAfter(res, baseKey, staleAt) {
+		// StoredAfter, not ReceivedAfter: HTTP dates are second-granular and
+		// the marker is not, so a same-second revalidation must still clear it.
+		if !h.resourceFreshAfter(res, resourceKey, staleAt) {
 			res.MarkStale()
 		}
+	} else if baseStale {
+		res.MarkStale()
 	}
-
-	// Secondary lookup for Vary
-	if vary := res.Header().Get("Vary"); vary != "" {
-		if varyWildcard(vary) {
-			_ = res.Close()
-			return nil, ErrNotFoundInCache
-		}
-		// Whether the BASE entry was invalidated, read before it is closed.
-		baseStale := res.IsStale()
-		variantKey := lookupKey.Vary(vary, req.Request).String()
-		varied, varyErr := h.cache.Retrieve(variantKey)
-		// The primary entry is not the one we serve, and nothing else will
-		// close it. Releasing it here is what keeps the disk backend from
-		// leaking a file handle on every Vary lookup.
-		_ = res.Close()
-		if varyErr != nil {
-			return varied, varyErr
-		}
-
-		// An invalidated base entry invalidates its variants.
-		//
-		// Invalidation marks the base GET/HEAD keys stale, but each variant is
-		// stored under its own Key.Vary(...) key, and the Cache interface
-		// cannot enumerate them. Without this, a request whose Vary headers
-		// matched an existing variant went on being served the pre-mutation
-		// representation, with no revalidation, after a successful
-		// POST/PUT/PATCH/DELETE.
-		//
-		// The variant is judged against the base key's invalidation TIME, not
-		// against whether the base entry currently reads as stale. Refetching
-		// one variant rewrites the base entry too, so a boolean would make
-		// every OTHER variant fresh again as soon as the first was replaced;
-		// comparing each variant's own Date against the marker keeps it stale
-		// until it is itself replaced.
-		if varied != nil {
-			// Each variant is judged against the BASE key's marker by its own
-			// receive time. A boolean would not do: refetching one variant
-			// rewrites the base entry, so every OTHER variant would go back to
-			// being a fresh HIT as soon as the first was replaced.
-			//
-			// h.staleAt reads the cache's own record when it keeps one, and
-			// the handler's otherwise -- the previous fallback to the base
-			// ENTRY's state reopened exactly that bug for third-party caches.
-			if staleAt, marked := h.staleAt(baseKey); marked {
-				// StoredAfter, not ReceivedAfter: HTTP dates are
-				// second-granular and the marker is not, so a variant
-				// revalidated in the same second as the mutation could never
-				// clear it and was revalidated upstream on every request.
-				if !h.resourceFreshAfter(varied, variantKey, staleAt) {
-					varied.MarkStale()
-				}
-			} else if baseStale {
-				varied.MarkStale()
-			}
-		}
-		req.servedKey = variantKey
-		res = varied
-	}
-
-	return res, nil
 }
 
 type cacheRequest struct {
@@ -1157,30 +1170,41 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 	if err != nil {
 		return nil
 	}
-	if u.Host != "" {
-		requestScheme := strings.ToLower(r.URL.Scheme)
-		if requestScheme == "" {
-			requestScheme = "http"
-			if r.TLS != nil {
-				requestScheme = "https"
-			}
-		}
-		targetScheme := strings.ToLower(u.Scheme)
-		if targetScheme == "" {
-			targetScheme = requestScheme
-		}
-
-		requestAuthority := r.Host
-		if requestAuthority == "" {
-			requestAuthority = r.URL.Host
-		}
-		requestHost, requestPort, requestOK := normalizedOriginAuthority(requestScheme, requestAuthority)
-		targetHost, targetPort, targetOK := normalizedOriginAuthority(targetScheme, u.Host)
-		if !requestOK || !targetOK || requestScheme != targetScheme ||
-			!strings.EqualFold(requestHost, targetHost) || requestPort != targetPort {
-			return nil
-		}
+	if u.Host != "" && !r.matchesOrigin(u) {
+		return nil
 	}
+	return r.invalidationTarget(u)
+}
+
+func (r *cacheRequest) originScheme() string {
+	if scheme := strings.ToLower(r.URL.Scheme); scheme != "" {
+		return scheme
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func (r *cacheRequest) matchesOrigin(target *url.URL) bool {
+	requestScheme := r.originScheme()
+	targetScheme := strings.ToLower(target.Scheme)
+	if targetScheme == "" {
+		targetScheme = requestScheme
+	}
+	requestAuthority := r.Host
+	if requestAuthority == "" {
+		requestAuthority = r.URL.Host
+	}
+	requestHost, requestPort, requestOK := normalizedOriginAuthority(requestScheme, requestAuthority)
+	targetHost, targetPort, targetOK := normalizedOriginAuthority(targetScheme, target.Host)
+	return requestOK && targetOK && requestScheme == targetScheme &&
+		strings.EqualFold(requestHost, targetHost) && requestPort == targetPort
+}
+
+// invalidationTarget preserves the request's URL form and the target's exact
+// escaped path, query and authority spelling used in direct-request cache keys.
+func (r *cacheRequest) invalidationTarget(u *url.URL) *url.URL {
 	// RawPath is carried through: url.Parse records "/objects/a%2Fb" in
 	// RawPath and the decoded "/objects/a/b" in Path, so dropping it produced
 	// an invalidation key for a different resource than the one a direct
