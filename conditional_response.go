@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Combine every field line, including raw non-canonical map keys supplied by
@@ -94,9 +95,16 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 		h.refetchVaryResponse(w, req, combinedHeaderValues(exchange.snapshot, "Vary"))
 		return false, true
 	}
-	client := newClientPreconditionWriter(w, req.Request)
+	h.deliverValidationExchange(w, &validation, req.Request, exchange, start)
+	return false, true
+}
+
+// deliverValidationExchange streams a captured origin response into bounded
+// staging while applying the original client conditions only to delivery.
+func (h *Handler) deliverValidationExchange(w http.ResponseWriter, storageReq *cacheRequest, original *http.Request, exchange *validationExchange, start time.Time) {
+	client := newClientPreconditionWriter(w, original)
 	copied := make(chan bool, 1)
-	h.passUpstreamWithHandler(client, &validation, nil, http.HandlerFunc(func(dst http.ResponseWriter, _ *http.Request) {
+	h.passUpstreamWithHandler(client, storageReq, nil, http.HandlerFunc(func(dst http.ResponseWriter, _ *http.Request) {
 		for name, values := range exchange.snapshot {
 			dst.Header()[name] = append([]string(nil), values...)
 		}
@@ -110,8 +118,33 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 		}
 		copied <- true
 	}), start)
-	finishValidationTrailers(req.Context(), client, exchange, copied)
-	return false, true
+	finishValidationTrailers(storageReq.Context(), client, exchange, copied)
+}
+
+// streamVaryRebuild checks the actual refetch's selection policy before any
+// client headers are committed. An origin may change Vary again between the
+// validation and this complete-body fetch.
+func (h *Handler) streamVaryRebuild(w http.ResponseWriter, rebuilt *cacheRequest, original *http.Request) {
+	exchange := newValidationExchange()
+	stop := context.AfterFunc(rebuilt.Context(), func() { _ = exchange.reader.CloseWithError(rebuilt.Context().Err()) })
+	defer stop()
+	defer func() { _ = exchange.reader.Close() }()
+	go exchange.serve(h.upstream, rebuilt.Request)
+	select {
+	case <-exchange.ready:
+	case <-rebuilt.Context().Done():
+		return
+	}
+	if varyChangedClientValidators(combinedHeaderValues(exchange.snapshot, "Vary"), original, rebuilt.Request) {
+		_ = exchange.reader.Close()
+		// Retry once with unchanged original selecting fields. Its response
+		// cannot have a mismatch caused by our own validator rewriting.
+		fallback := *rebuilt
+		fallback.Request = original
+		h.refetchOriginalResponse(w, &fallback)
+		return
+	}
+	h.deliverValidationExchange(w, rebuilt, original, exchange, rebuilt.Time)
 }
 
 func (h *Handler) fullResponseVaryChanged(req *cacheRequest, status int, previous, replacement http.Header) bool {

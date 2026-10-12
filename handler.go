@@ -437,7 +437,6 @@ func (h *Handler) refetchVaryResponse(rw http.ResponseWriter, cReq *cacheRequest
 	fetch := cReq.Clone(cReq.Context())
 	fetch.Header.Del("If-None-Match")
 	fetch.Header.Del("If-Modified-Since")
-	client := newClientPreconditionWriter(rw, cReq.Request)
 	// Vary must describe the request that produced the stored response. Keep
 	// the original base/policy identity, but select its variant from the
 	// unconditional fetch rather than the client's removed validators.
@@ -446,20 +445,7 @@ func (h *Handler) refetchVaryResponse(rw http.ResponseWriter, cReq *cacheRequest
 	rebuilt := *cReq
 	rebuilt.Request = fetch // Storage variants must describe the headers sent upstream.
 	rebuilt.Time = Clock()
-	finished := make(chan struct{})
-	h.passUpstreamWithHandler(client, &rebuilt, nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		defer close(finished)
-		h.upstream.ServeHTTP(w, fetch)
-	}), rebuilt.Time)
-	// Main-path header updates must finish too: an empty uncacheable response
-	// can still be assigning X-Cache while the origin handler returns.
-	select {
-	case <-finished:
-		if finisher, ok := client.(interface{ finishTrailers() }); ok {
-			finisher.finishTrailers()
-		}
-	case <-cReq.Context().Done():
-	}
+	h.streamVaryRebuild(rw, &rebuilt, cReq.Request)
 }
 
 func (h *Handler) freshenValidatedResponse(res *Resource, keys []string) bool {
