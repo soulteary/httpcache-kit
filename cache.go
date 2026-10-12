@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"container/list"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"os"
 	pathutil "path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,6 +106,16 @@ type cacheEntry struct {
 	storedAt   time.Time
 	accessedAt time.Time
 	element    *list.Element // for LRU tracking
+	generation *cacheGeneration
+}
+
+// A nonzero-sized identity distinguishes successful publications even when
+// Clock returns equal or decreasing timestamps. It never enters disk records.
+type cacheGeneration struct{ _ byte }
+
+type cacheKeyWriter struct {
+	mu    sync.RWMutex
+	users int
 }
 
 // cache provides a storage mechanism for cached Resources
@@ -132,6 +145,14 @@ type cache struct {
 	// body with the other's header.
 	publishMu sync.RWMutex
 
+	// Same-key writers and generic VFS readers share a long-lived lock.
+	// Different keys remain streamable in parallel, while native disk readers
+	// can still open the previous generation during staging. The reference
+	// count bounds the map to keys with an active or waiting reader/writer.
+	writerMu    sync.Mutex
+	writers     map[string]*cacheKeyWriter
+	directoryMu sync.Mutex
+
 	// stale map with mutex protection
 	stale           map[string]time.Time
 	staleGeneration uint64
@@ -142,6 +163,10 @@ type cache struct {
 	lruIndex  map[string]*cacheEntry // hashedKey -> entry
 	lruMutex  sync.RWMutex
 	totalSize int64
+	// Admission reserves growth until publication updates totalSize. Even a
+	// zero-growth reservation protects an entry being replaced or freshened.
+	reservations map[string]int64
+	reservedSize int64
 
 	// Statistics
 	hitCount  int64
@@ -157,18 +182,22 @@ type cache struct {
 
 var _ Cache = (*cache)(nil)
 var _ ExtendedCache = (*cache)(nil)
+var _ ContextStore = (*cache)(nil)
 
 type Header struct {
 	http.Header
 	StatusCode int
 }
 
-// NewVFSCache returns a cache backend off the provided VFS
+// NewVFSCache returns a cache backend off the provided VFS. Its open readers
+// must retain their contents when the same path is rewritten. For ordinary
+// OS files, use NewDiskCache, which preserves readers through atomic rename.
 func NewVFSCache(fs vfs.VFS) Cache {
 	return NewVFSCacheWithConfig(fs, nil)
 }
 
-// NewVFSCacheWithConfig returns a cache backend with custom configuration
+// NewVFSCacheWithConfig returns a cache backend with custom configuration.
+// Its VFS must provide the stable-reader semantics described by NewVFSCache.
 func NewVFSCacheWithConfig(fs vfs.VFS, config *CacheConfig) ExtendedCache {
 	return newVFSCacheWithConfig(fs, config, "")
 }
@@ -266,6 +295,7 @@ func (c *cache) scanExistingCache() error {
 			size:       info.Size(),
 			storedAt:   storedAt,
 			accessedAt: info.ModTime(),
+			generation: new(cacheGeneration),
 		}
 
 		// Check if corresponding header file exists and add its size
@@ -278,7 +308,9 @@ func (c *cache) scanExistingCache() error {
 			// fallback; a new-format preamble supplies the exact timestamp.
 			entry.storedAt = headerInfo.ModTime()
 			entry.accessedAt = headerInfo.ModTime()
-			if _, persistedAt, readErr := c.readHeaderFile(headerPath, hashedKey); readErr == nil && !persistedAt.IsZero() {
+			// A scan has only the filename hash, not the original request key.
+			// Validate the private record while deferring its key binding to lookup.
+			if _, persistedAt, _, readErr := c.readHeaderRecordWithKeyCheck(headerPath, hashedKey, false); readErr == nil && !persistedAt.IsZero() {
 				entry.storedAt = persistedAt
 				entry.accessedAt = persistedAt
 			}
@@ -339,6 +371,7 @@ type stagedEntry struct {
 	tmpPath   string
 	target    string
 	published bool
+	lease     StagingLease
 }
 
 // stageWrite writes path's new contents, publishing them immediately only on
@@ -351,23 +384,93 @@ type stagedEntry struct {
 // write. readHeaderFile's terminator check still turns that window into a
 // miss on backends that keep it.
 func (c *cache) stageWrite(path string, r io.Reader) (*stagedEntry, int64, error) {
-	if err := vfs.MkdirAll(c.fs, pathutil.Dir(path), 0700); err != nil {
+	return c.stageWriteContext(context.Background(), path, r)
+}
+
+func (c *cache) stageWriteContext(ctx context.Context, path string, r io.Reader) (*stagedEntry, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	if err := c.mkdirAll(pathutil.Dir(path)); err != nil {
 		return nil, 0, fmt.Errorf("failed to create cache directory for %q: %w", path, err)
 	}
 	if c.diskRoot == "" {
-		n, published, err := c.vfsWrite(path, r)
+		n, published, err := c.vfsWrite(path, &contextReader{ctx: ctx, r: r})
 		return &stagedEntry{published: published}, n, err
 	}
-	if err := vfs.MkdirAll(c.fs, stagingPrefix+formatPrefix, 0700); err != nil {
+	if err := c.mkdirAll(stagingPrefix + formatPrefix); err != nil {
 		return nil, 0, fmt.Errorf("failed to create staging directory: %w", err)
 	}
 	stagingDir := filepath.Join(c.diskRoot, filepath.FromSlash(stagingPrefix+formatPrefix))
 	target := filepath.Join(c.diskRoot, filepath.FromSlash(path))
-	tmpPath, n, err := writeStagingFile(stagingDir, target, r)
-	if err != nil {
-		return nil, n, err
+	kind := StageCacheBody
+	if strings.HasPrefix(path, headerPrefix) {
+		kind = StageCacheHeader
 	}
-	return &stagedEntry{tmpPath: tmpPath, target: target}, n, nil
+	lease, err := newStageLease(ctx, c.config.StagingBudget, kind)
+	if err != nil {
+		return nil, 0, err
+	}
+	f, err := os.CreateTemp(stagingDir, filepath.Base(target)+".tmp-*")
+	if err != nil {
+		closeStageLease(lease)
+		return nil, 0, err
+	}
+	e := &stagedEntry{tmpPath: f.Name(), target: target, lease: lease}
+	n, copyErr := io.Copy(&stagingWriter{ctx: ctx, w: f, lease: lease}, r)
+	err = errors.Join(copyErr, f.Close())
+	if err != nil {
+		c.abandonStaged(e)
+	}
+	return e, n, err
+}
+
+func (c *cache) mkdirAll(path string) error {
+	// Some VFS implementations do not accept a directory created between
+	// their Stat and Mkdir calls. Serialize only this short shared operation.
+	c.directoryMu.Lock()
+	defer c.directoryMu.Unlock()
+	return vfs.MkdirAll(c.fs, path, 0700)
+}
+
+func (c *cache) lockKeyWriter(hashedKey string) func() {
+	return c.lockKey(hashedKey, false)
+}
+
+func (c *cache) lockKeyReader(hashedKey string) func() {
+	return c.lockKey(hashedKey, true)
+}
+
+func (c *cache) lockKey(hashedKey string, read bool) func() {
+	c.writerMu.Lock()
+	if c.writers == nil {
+		c.writers = make(map[string]*cacheKeyWriter)
+	}
+	writer := c.writers[hashedKey]
+	if writer == nil {
+		writer = &cacheKeyWriter{}
+		c.writers[hashedKey] = writer
+	}
+	writer.users++
+	c.writerMu.Unlock()
+	if read {
+		writer.mu.RLock()
+	} else {
+		writer.mu.Lock()
+	}
+	return func() {
+		if read {
+			writer.mu.RUnlock()
+		} else {
+			writer.mu.Unlock()
+		}
+		c.writerMu.Lock()
+		writer.users--
+		if writer.users == 0 {
+			delete(c.writers, hashedKey)
+		}
+		c.writerMu.Unlock()
+	}
 }
 
 // commitStaged publishes every staged file as one step, so a reader holding
@@ -375,6 +478,12 @@ func (c *cache) stageWrite(path string, r io.Reader) (*stagedEntry, int64, error
 func (c *cache) commitStaged(entries ...*stagedEntry) error {
 	c.publishMu.Lock()
 	defer c.publishMu.Unlock()
+	return c.commitStagedLocked(entries...)
+}
+
+// commitStagedLocked requires publishMu, allowing a failed multi-key commit
+// to discard its partial publication before any reader observes it.
+func (c *cache) commitStagedLocked(entries ...*stagedEntry) error {
 	for _, e := range entries {
 		if e == nil || e.tmpPath == "" {
 			continue
@@ -384,6 +493,8 @@ func (c *cache) commitStaged(entries ...*stagedEntry) error {
 		}
 		e.tmpPath = ""
 		e.published = true
+		closeStageLease(e.lease)
+		e.lease = nil
 	}
 	return nil
 }
@@ -396,8 +507,11 @@ func (c *cache) abandonStaged(entries ...*stagedEntry) {
 		}
 		if err := os.Remove(e.tmpPath); err != nil && !os.IsNotExist(err) {
 			debugf("failed to remove staging file %s: %v", e.tmpPath, err)
+			continue
 		}
 		e.tmpPath = ""
+		closeStageLease(e.lease)
+		e.lease = nil
 	}
 }
 
@@ -416,7 +530,7 @@ func anyPublished(entries ...*stagedEntry) bool {
 // sit outside the scanned directories, so they never reach the LRU index, but
 // nothing else would reclaim their space either.
 func (c *cache) sweepStaging() {
-	if c.diskRoot == "" {
+	if c.diskRoot == "" || c.config.DisableStagingSweep {
 		return
 	}
 	dir := stagingPrefix + formatPrefix
@@ -439,7 +553,7 @@ func (c *cache) sweepStaging() {
 // cache entry use that bit to discard stale metadata after delayed copy/close
 // failures without deleting a still-intact entry after a pre-open failure.
 func (c *cache) vfsWrite(path string, r io.Reader) (int64, bool, error) {
-	if err := vfs.MkdirAll(c.fs, pathutil.Dir(path), 0700); err != nil {
+	if err := c.mkdirAll(pathutil.Dir(path)); err != nil {
 		return 0, false, fmt.Errorf("failed to create cache directory for %q: %w", path, err)
 	}
 	f, err := c.fs.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
@@ -464,33 +578,7 @@ func (c *cache) vfsWrite(path string, r io.Reader) (int64, bool, error) {
 //
 // The stale map takes this: losing invalidation state would republish
 // superseded content, so it is worth the fsync. Cache entries go through
-// writeStagingFile instead, which skips it.
-// writeStagingFile writes r into a fresh file under stagingDir and returns its
-// path. The caller renames it onto target to publish it, or removes it. The
-// name carries target's base so a leftover file is traceable.
-//
-// No fsync: rename is what makes a reader see either the old entry or the
-// whole new one, and that is all a cache entry needs. Durability across a
-// crash is not worth its price here -- an entry lost to a crash is a miss, and
-// the fsync costs several times the write itself.
-func writeStagingFile(stagingDir, target string, r io.Reader) (string, int64, error) {
-	f, err := os.CreateTemp(stagingDir, filepath.Base(target)+".tmp-*")
-	if err != nil {
-		return "", 0, fmt.Errorf("failed to create staging file for %q: %w", target, err)
-	}
-	tmpPath := f.Name()
-	n, copyErr := io.Copy(f, r)
-	closeErr := f.Close()
-	if copyErr != nil {
-		_ = os.Remove(tmpPath)
-		return "", n, fmt.Errorf("failed to write staging file for %q: %w", target, copyErr)
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmpPath)
-		return "", n, fmt.Errorf("failed to close staging file for %q: %w", target, closeErr)
-	}
-	return tmpPath, n, nil
-}
+// stageWriteContext instead, which skips it.
 
 func atomicWriteFile(path string, r io.Reader) (int64, error) {
 	dir := filepath.Dir(path)
@@ -527,9 +615,36 @@ func atomicWriteFile(path string, r io.Reader) (int64, error) {
 
 // Retrieve the Status and Headers for a given key path
 func (c *cache) Header(key string) (Header, error) {
-	path := headerPrefix + formatPrefix + hashKey(key)
-	h, _, err := c.readHeaderFile(path, key)
-	return h, err
+	h, err := c.header(key)
+	return h, c.integrityMiss(key, err)
+}
+
+func (c *cache) header(key string) (Header, error) {
+	hashed := hashKey(key)
+	if c.diskRoot == "" {
+		unlock := c.lockKeyReader(hashed)
+		defer unlock()
+	}
+	c.cleanupMu.RLock()
+	defer c.cleanupMu.RUnlock()
+	c.publishMu.RLock()
+	defer c.publishMu.RUnlock()
+	h, _, meta, err := c.readHeaderRecord(headerPrefix+formatPrefix+hashed, key)
+	if err != nil || meta == nil {
+		return h, err
+	}
+	f, err := c.fs.Open(bodyPrefix + formatPrefix + hashed)
+	if err != nil {
+		if vfs.IsNotExist(err) {
+			return Header{}, &corruptEntryError{fingerprint: meta.fingerprint, reason: "body missing"}
+		}
+		return Header{}, err
+	}
+	defer func() { _ = f.Close() }()
+	if err := verifyStoredBody(f, meta, meta.fingerprint); err != nil {
+		return Header{}, err
+	}
+	return h, nil
 }
 
 // readHeaderFile reads a stored response header and its separate cache
@@ -541,15 +656,37 @@ func (c *cache) Header(key string) (Header, error) {
 // them leaves a single CRLF, not two.
 const headerRecordTerminator = "\r\n\r\n"
 
-func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
+func (c *cache) readHeaderRecord(path, key string) (Header, time.Time, *integrityRecord, error) {
+	return c.readHeaderRecordWithKeyCheck(path, key, true)
+}
+
+func (c *cache) readHeaderRecordWithKeyCheck(path, key string, checkKey bool) (Header, time.Time, *integrityRecord, error) {
+	h, at, meta, _, err := c.readHeaderProvenance(path, key, checkKey, false)
+	return h, at, meta, err
+}
+
+// The exact persisted record supplements the process-local ledger identity.
+// Another coordinated cache instance cannot update this instance's ledger.
+type headerProvenance struct {
+	fileInfo    os.FileInfo
+	fingerprint string
+	file        vfs.RFile
+}
+
+func (c *cache) readHeaderProvenance(path, key string, checkKey, retainFile bool) (Header, time.Time, *integrityRecord, *headerProvenance, error) {
 	f, err := c.fs.Open(path)
 	if err != nil {
 		if vfs.IsNotExist(err) {
-			return Header{}, time.Time{}, ErrNotFoundInCache
+			return Header{}, time.Time{}, nil, nil, ErrNotFoundInCache
 		}
-		return Header{}, time.Time{}, fmt.Errorf("failed to open header file %q for key %q: %w", path, key, err)
+		return Header{}, time.Time{}, nil, nil, fmt.Errorf("failed to open header file %q for key %q: %w", path, key, err)
 	}
-	defer func() { _ = f.Close() }()
+	retained := false
+	defer func() {
+		if !retained {
+			_ = f.Close()
+		}
+	}()
 
 	// Read the record whole. Headers are small, and completeness has to be
 	// judged before parsing: a partial record can parse into a plain error
@@ -557,7 +694,7 @@ func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 	// from corruption once the bytes are gone.
 	raw, err := io.ReadAll(f)
 	if err != nil {
-		return Header{}, time.Time{}, fmt.Errorf("failed to read header file %q for key %q: %w", path, key, err)
+		return Header{}, time.Time{}, nil, nil, fmt.Errorf("failed to read header file %q for key %q: %w", path, key, err)
 	}
 
 	// The header file is this entry's commit marker. Store writes the body in
@@ -577,17 +714,49 @@ func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 	// resource whenever two requests for the same uncached URL overlapped,
 	// which is the ordinary case for a shared cache.
 	if !bytes.HasSuffix(raw, []byte(headerRecordTerminator)) {
-		return Header{}, time.Time{}, ErrNotFoundInCache
+		return Header{}, time.Time{}, nil, nil, ErrNotFoundInCache
 	}
 
+	var meta *integrityRecord
+	if checkKey {
+		meta, err = decodeIntegrity(raw, key, c.config.Integrity != IntegrityDisabled)
+	} else {
+		meta, err = decodeIntegrityRecord(raw, key, c.config.Integrity != IntegrityDisabled, false)
+	}
+	if err != nil {
+		return Header{}, time.Time{}, nil, nil, err
+	}
 	h, storedAt, err := readStoredHeaders(bufio.NewReader(bytes.NewReader(raw)))
 	if err != nil {
 		// The record is terminated, so this is a complete header that does not
 		// parse: corruption, not a write in flight.
-		return Header{}, time.Time{}, fmt.Errorf("failed to read headers from %q for key %q: %w", path, key, err)
+		if meta != nil {
+			return Header{}, time.Time{}, nil, nil, &corruptEntryError{fingerprint: meta.fingerprint, reason: "invalid HTTP header record"}
+		}
+		return Header{}, time.Time{}, nil, nil, fmt.Errorf("failed to read headers from %q for key %q: %w", path, key, err)
 	}
 
-	return h, storedAt, nil
+	proof := &headerProvenance{fingerprint: sha256Text(raw)}
+	if c.diskRoot != "" {
+		proof.fileInfo, err = c.headerFileInfo(f, path)
+		if err != nil {
+			return Header{}, time.Time{}, nil, nil, fmt.Errorf("failed to identify header for key %q: %w", key, err)
+		}
+		if retainFile {
+			proof.file = f
+			retained = true
+		}
+	}
+	return h, storedAt, meta, proof, nil
+}
+
+func (c *cache) headerFileInfo(f vfs.RFile, path string) (os.FileInfo, error) {
+	if stat, ok := f.(interface{ Stat() (os.FileInfo, error) }); ok {
+		return stat.Stat()
+	}
+	// VFS decorators can hide the opened native file's Stat method. Native
+	// callers coordinate publication while this record is being retrieved.
+	return c.fs.Stat(path)
 }
 
 // Store a resource against a number of keys. Resource bodies are streamed
@@ -595,6 +764,14 @@ func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 // Vary key), the seekable resource is rewound instead of being copied into an
 // unbounded in-memory buffer.
 func (c *cache) Store(res *Resource, keys ...string) error {
+	return c.StoreContext(context.Background(), res, keys...)
+}
+
+// StoreContext is Store with cooperative cancellation between streamed writes.
+func (c *cache) StoreContext(ctx context.Context, res *Resource, keys ...string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(keys) == 0 {
 		return nil
 	}
@@ -606,17 +783,143 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 	c.generationMu.RLock()
 	defer c.generationMu.RUnlock()
 
+	// Lock every target in a stable order, including keys not yet staged. A
+	// failed transaction cannot remove a newer Store/Freshen generation, and
+	// overlapping transactions cannot deadlock with reversed key lists.
+	keys, unlock := c.lockStoreKeys(keys)
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if c.responseSuperseded(res, keys) {
 		return nil
 	}
 
-	expectedSize, hasExpectedSize := expectedBodySize(res.Header())
-	for _, key := range keys {
-		if err := c.storeResourceForKey(res, key, expectedSize, hasExpectedSize); err != nil {
-			return err
+	prepared := make([]*preparedCacheEntry, len(keys))
+	for i, key := range keys {
+		prepared[i] = &preparedCacheEntry{key: key, hashedKey: hashKey(key), storedAt: Clock()}
+		// Protect all old variants before admission can evict any of them.
+		c.beginReservation(prepared[i].hashedKey)
+		defer c.releaseReservation(prepared[i].hashedKey)
+	}
+
+	// Target writer locks hide generic VFS in-place writes from same-key
+	// readers. Publication only holds the global lock for commit or rollback,
+	// allowing unrelated keys to stream and reserve capacity concurrently.
+	locked := false
+	defer func() {
+		if locked {
+			c.publishMu.Unlock()
 		}
+	}()
+	fail := func(err error) error {
+		if !locked {
+			c.publishMu.Lock()
+			locked = true
+		}
+		return c.discardPreparedStore(err, prepared)
+	}
+
+	files, err := c.prepareStoreEntries(ctx, res, prepared)
+	if err != nil {
+		return fail(err)
+	}
+	if !locked {
+		c.publishMu.Lock()
+		locked = true
+	}
+	// Cancellation may arrive while waiting for another publication.
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	if err := c.commitStagedLocked(files...); err != nil {
+		return fail(err)
+	}
+	for _, entry := range prepared {
+		c.trackEntry(entry.key, entry.hashedKey, entry.size, entry.storedAt)
 	}
 	return nil
+}
+
+// prepareStoreEntries stages each target without exposing any disk generation.
+// Publication and rollback remain owned by StoreContext.
+func (c *cache) prepareStoreEntries(ctx context.Context, res *Resource, entries []*preparedCacheEntry) ([]*stagedEntry, error) {
+	expectedSize, hasExpectedSize := expectedBodySize(res.Header())
+	var files []*stagedEntry
+	for _, entry := range entries {
+		if err := c.prepareResourceForKey(ctx, res, entry, expectedSize, hasExpectedSize); err != nil {
+			return nil, err
+		}
+		files = append(files, entry.body, entry.header)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+// lockStoreKeys deduplicates target hashes while preserving the caller's key
+// order for staging. Only lock acquisition is sorted.
+func (c *cache) lockStoreKeys(keys []string) ([]string, func()) {
+	unique := make([]string, 0, len(keys))
+	hashes := make([]string, 0, len(keys))
+	seen := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		hashed := hashKey(key)
+		if !seen[hashed] {
+			seen[hashed] = true
+			unique = append(unique, key)
+			hashes = append(hashes, hashed)
+		}
+	}
+	sort.Strings(hashes)
+	unlocks := make([]func(), 0, len(hashes))
+	for _, hashed := range hashes {
+		unlocks = append(unlocks, c.lockKeyWriter(hashed))
+	}
+	return unique, func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
+	}
+}
+
+// preparedCacheEntry retains admission and staging state until all keys can
+// be published together. Its size also accounts for failed in-place writes.
+type preparedCacheEntry struct {
+	key, hashedKey string
+	storedAt       time.Time
+	body, header   *stagedEntry
+	size           int64
+}
+
+// discardPreparedStore requires all target writer locks and publishMu. Disk
+// staging failures leave the old generation intact. If a VFS write or rename
+// has published anything, discard all transaction keys, including untouched
+// old variants, before readers or newer writers can reach a mixed generation.
+func (c *cache) discardPreparedStore(err error, entries []*preparedCacheEntry) error {
+	published := false
+	for _, entry := range entries {
+		published = published || anyPublished(entry.body, entry.header)
+		c.abandonStaged(entry.body, entry.header)
+	}
+	if !published {
+		return err
+	}
+	for _, entry := range entries {
+		if discardErr := c.discardUnadmitted(entry.key, entry.hashedKey, entry.size, entry.storedAt); discardErr != nil {
+			// A backend refusing removal must not serve its residual generation
+			// as fresh. Preserve a concurrent Invalidate barrier if present.
+			c.staleMutex.Lock()
+			if now := Clock(); c.stale[entry.key].Before(now) {
+				c.stale[entry.key] = now
+			}
+			c.persistStale(c.snapshotStaleLocked())
+			c.staleMutex.Unlock()
+			err = errors.Join(err, fmt.Errorf("discard entry after failed store for key %q: %w", entry.key, discardErr))
+		}
+	}
+	return err
 }
 
 // responseSuperseded checks every governing key before any entry is changed.
@@ -643,9 +946,10 @@ func expectedBodySize(h http.Header) (int64, bool) {
 	return length, true
 }
 
-// storeResourceForKey stages, admits, and publishes one entry. The caller
-// holds generationMu so invalidation cannot finalize between these steps.
-func (c *cache) storeResourceForKey(res *Resource, key string, expectedSize int64, hasExpectedSize bool) error {
+// prepareResourceForKey stages and admits one entry without publishing it.
+// The caller holds generationMu and every transaction target's writer lock.
+func (c *cache) prepareResourceForKey(ctx context.Context, res *Resource, entry *preparedCacheEntry, expectedSize int64, hasExpectedSize bool) error {
+	key, hashedKey := entry.key, entry.hashedKey
 	if _, err := res.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("failed to rewind resource for key %q: %w", key, err)
 	}
@@ -660,9 +964,8 @@ func (c *cache) storeResourceForKey(res *Resource, key string, expectedSize int6
 	// pre-mutation response as fresh, and refetching ONE Vary variant
 	// cleared the base marker that every OTHER variant is still judged
 	// against. The cleanup goroutine expires markers on its own.
-	hashedKey := hashKey(key)
-	storedAt := Clock()
-	headerData, err := serializeStoredHeader(res.Status(), res.Header(), storedAt)
+	storedAt := entry.storedAt
+	headerData, err := c.serializeCacheHeader(res.Status(), res.Header(), storedAt, key, expectedSize, strings.Repeat("0", 64))
 	if err != nil {
 		return fmt.Errorf("failed to serialize headers for key %q: %w", key, err)
 	}
@@ -672,7 +975,7 @@ func (c *cache) storeResourceForKey(res *Resource, key string, expectedSize int6
 	// persisted header is part of the admission size too; excluding it lets
 	// otherwise equal replacements drift beyond MaxSize.
 	if hasExpectedSize {
-		if err := c.evictIfNeeded(hashedKey, expectedSize+int64(len(headerData))); err != nil {
+		if err := c.reserveEntry(hashedKey, expectedSize+int64(len(headerData))); err != nil {
 			return fmt.Errorf("failed to make room for key %q: %w", key, err)
 		}
 	}
@@ -686,67 +989,50 @@ func (c *cache) storeResourceForKey(res *Resource, key string, expectedSize int6
 	// every failure here just drops the staged files. On a backend that
 	// writes in place there is nothing to stage, and the existing discard
 	// path still applies -- anyPublished says which case this is.
-	bodyStaged, written, err := c.stageBody(body, key)
-	fail := func(err error) error {
-		return c.discardFailedStore(err, key, hashedKey, bodyStaged, written+int64(len(headerData)), storedAt)
+	digest := sha256.New()
+	if c.config.Integrity != IntegrityDisabled {
+		body = io.TeeReader(body, digest)
 	}
+	bodyStaged, written, err := c.stageBodyContext(ctx, body, key)
+	entry.body = bodyStaged
+	entry.size = written + int64(len(headerData))
 	if err != nil {
-		return fail(err)
+		return err
 	}
 	if hasExpectedSize && written != expectedSize {
-		return fail(fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize))
+		return fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize)
 	}
-	if !hasExpectedSize {
-		if err := c.evictIfNeeded(hashedKey, written+int64(len(headerData))); err != nil {
-			return fail(fmt.Errorf("failed to make room for key %q: %w", key, err))
-		}
-	}
-
-	headerStaged, headerBytes, err := c.stageSerializedHeader(headerData, key)
+	headerData, err = c.serializeCacheHeader(res.Status(), res.Header(), storedAt, key, written, fmt.Sprintf("%x", digest.Sum(nil)))
 	if err != nil {
-		c.abandonStaged(headerStaged)
-		return fail(err)
+		return err
+	}
+	if err := c.reserveEntry(hashedKey, written+int64(len(headerData))); err != nil {
+		return fmt.Errorf("failed to make room for key %q: %w", key, err)
 	}
 
-	// One step, under publishMu: a reader sees the whole previous entry or
-	// the whole new one, never one version's body with the other's header.
-	if err := c.commitStaged(bodyStaged, headerStaged); err != nil {
-		c.abandonStaged(bodyStaged, headerStaged)
-		return fail(err)
+	headerStaged, headerBytes, err := c.stageSerializedHeaderContext(ctx, headerData, key)
+	entry.header = headerStaged
+	entry.size = written + headerBytes
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		return err
 	}
 
-	// Update LRU tracking
-	c.trackEntry(key, hashedKey, written+headerBytes, storedAt)
 	return nil
 }
 
-// discardFailedStore preserves a previous entry if staging never published
-// anything. An in-place write or partially completed commit must instead
-// remove the changed entry, retaining its size for cleanup if removal fails.
-func (c *cache) discardFailedStore(err error, key, hashedKey string, body *stagedEntry, residualSize int64, storedAt time.Time) error {
-	c.abandonStaged(body)
-	if anyPublished(body) {
-		if discardErr := c.discardUnadmitted(key, hashedKey, residualSize, storedAt); discardErr != nil {
-			err = errors.Join(err, fmt.Errorf("discard entry after failed store for key %q: %w", key, discardErr))
-		}
-	}
-	return err
+func (c *cache) stageBody(r io.Reader, key string) (*stagedEntry, int64, error) {
+	return c.stageBodyContext(context.Background(), r, key)
 }
 
-func (c *cache) stageBody(r io.Reader, key string) (*stagedEntry, int64, error) {
-	e, n, err := c.stageWrite(bodyPrefix+formatPrefix+hashKey(key), r)
+func (c *cache) stageBodyContext(ctx context.Context, r io.Reader, key string) (*stagedEntry, int64, error) {
+	e, n, err := c.stageWriteContext(ctx, bodyPrefix+formatPrefix+hashKey(key), r)
 	if err != nil {
 		return e, n, fmt.Errorf("failed to store body for key %q: %w", key, err)
 	}
 	return e, n, nil
-}
-
-func (c *cache) storeHeader(code int, h http.Header, key string, storedAt time.Time) (int64, bool, error) {
-	headerData, err := serializeStoredHeader(code, h, storedAt)
-	if err != nil {
-		return 0, false, fmt.Errorf("failed to serialize headers for key %q: %w", key, err)
-	}
-	return c.storeSerializedHeader(headerData, key)
 }
 
 func serializeStoredHeader(code int, h http.Header, storedAt time.Time) ([]byte, error) {
@@ -760,31 +1046,51 @@ func serializeStoredHeader(code int, h http.Header, storedAt time.Time) ([]byte,
 }
 
 func (c *cache) stageSerializedHeader(headerData []byte, key string) (*stagedEntry, int64, error) {
-	e, n, err := c.stageWrite(headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(headerData))
+	return c.stageSerializedHeaderContext(context.Background(), headerData, key)
+}
+
+func (c *cache) stageSerializedHeaderContext(ctx context.Context, headerData []byte, key string) (*stagedEntry, int64, error) {
+	e, n, err := c.stageWriteContext(ctx, headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(headerData))
 	if err != nil {
 		return e, n, fmt.Errorf("failed to store header for key %q: %w", key, err)
 	}
 	return e, n, nil
 }
 
-// storeSerializedHeader writes and publishes a header on its own. Only the
-// freshening path uses it, where the body is unchanged and there is nothing to
-// pair the header with.
-func (c *cache) storeSerializedHeader(headerData []byte, key string) (int64, bool, error) {
-	e, n, err := c.stageSerializedHeader(headerData, key)
-	if err != nil {
-		c.abandonStaged(e)
-		return n, anyPublished(e), err
-	}
-	if err := c.commitStaged(e); err != nil {
-		c.abandonStaged(e)
-		return n, anyPublished(e), err
-	}
-	return n, true, nil
-}
-
 // Retrieve returns a cached Resource for the given key
 func (c *cache) Retrieve(key string) (*Resource, error) {
+	return c.retrieveRecorded(key, true)
+}
+
+// RetrieveForRecheck performs an internal fill recheck without counting another
+// public cache access. Both hit and miss counters stay unchanged; verification,
+// corruption cleanup and LRU updates retain their ordinary behavior. Wrappers
+// may forward this optional method without changing the public Cache interface.
+func (c *cache) RetrieveForRecheck(key string) (*Resource, error) {
+	return c.retrieveUncounted(key)
+}
+
+// retrieveUncounted performs a coordinator's internal recheck without counting
+// another public cache access. Verification, corruption cleanup and LRU updates
+// are identical to Retrieve.
+func (c *cache) retrieveUncounted(key string) (*Resource, error) {
+	return c.retrieveRecorded(key, false)
+}
+
+func (c *cache) retrieveRecorded(key string, record bool) (*Resource, error) {
+	res, err := c.retrieve(key, record)
+	return res, c.integrityResult(key, err, record)
+}
+
+func (c *cache) retrieve(key string, record bool) (*Resource, error) {
+	hashedKey := hashKey(key)
+	// Generic VFS publication rewrites live files, so same-key readers wait
+	// for the complete writer transaction. Acquire this before publishMu to
+	// avoid blocking a writer's commit while waiting for its key lock.
+	if c.diskRoot == "" {
+		unlock := c.lockKeyReader(hashedKey)
+		defer unlock()
+	}
 	// Cleanup removes an expired entry and its invalidation marker as one
 	// generation transition. Holding the read side from file open through the
 	// marker check means a retrieval either observes the old file WITH its
@@ -800,30 +1106,46 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 	c.publishMu.RLock()
 	defer c.publishMu.RUnlock()
 
-	hashedKey := hashKey(key)
 	bodyPath := bodyPrefix + formatPrefix + hashedKey
+	storedGeneration := c.entryGeneration(hashedKey)
 	f, err := c.fs.Open(bodyPath)
 	if err != nil {
 		if vfs.IsNotExist(err) {
-			c.recordMiss()
+			if record {
+				c.recordMiss()
+			}
 			return nil, ErrNotFoundInCache
 		}
 		return nil, fmt.Errorf("failed to open body file %q for key %q: %w", bodyPath, key, err)
 	}
-	h, persistedAt, err := c.readHeaderFile(headerPrefix+formatPrefix+hashedKey, key)
+	h, persistedAt, meta, proof, err := c.readHeaderProvenance(headerPrefix+formatPrefix+hashedKey, key, true, true)
 	if err != nil {
 		_ = f.Close()
 		if err == ErrNotFoundInCache {
-			c.recordMiss()
+			if record {
+				c.recordMiss()
+			}
 			return nil, ErrNotFoundInCache
 		}
 		return nil, fmt.Errorf("failed to retrieve header for key %q: %w", key, err)
+	}
+	if proof.file != nil {
+		f = &headerRetainingBody{ReadSeekCloser: f, header: proof.file}
+	}
+	if meta != nil {
+		if err := verifyStoredBody(f, meta, meta.fingerprint); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 	}
 	res := NewResource(h.StatusCode, f, h.Header)
 	if persistedAt.IsZero() {
 		persistedAt = c.entryStoredAt(hashedKey)
 	}
 	res.SetStoredAt(persistedAt)
+	res.storedKey = key
+	res.storageGeneration = storedGeneration
+	res.storageRecord = proof
 
 	// Check stale map with proper locking
 	c.staleMutex.RLock()
@@ -839,7 +1161,9 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 
 	// Update LRU access time
 	c.touchEntry(hashedKey)
-	c.recordHit()
+	if record {
+		c.recordHit()
+	}
 
 	return res, nil
 }
@@ -1093,26 +1417,15 @@ func (c *cache) Freshen(res *Resource, keys ...string) error {
 		}
 
 		for _, key := range keys {
-			if h, headerErr := c.Header(key); headerErr == nil {
-				if h.StatusCode == res.Status() && headersEqual(h.Header, res.Header()) {
-					debugf("freshening key %s", key)
-					freshenedAt := Clock()
-					if _, headerModified, writeErr := c.storeHeader(h.StatusCode, res.Header(), key, freshenedAt); writeErr != nil {
-						if headerModified {
-							if discardErr := c.discardUnadmitted(key, hashKey(key), 0, freshenedAt); discardErr != nil {
-								writeErr = errors.Join(writeErr, fmt.Errorf("discard entry after failed header write for key %q: %w", key, discardErr))
-							}
-						}
-						return fmt.Errorf("failed to freshen header for key %q: %w", key, writeErr)
-					}
-					// The entry has just been validated against the origin, so
-					// its full-precision generation is updated in memory and in
-					// the stored header used after a disk-cache restart.
-					c.markFreshened(hashKey(key), freshenedAt)
-				} else {
-					debugf("freshen failed, invalidating %s", key)
-					invalidate = append(invalidate, key)
-				}
+			if res.storedKey != "" && key != res.storedKey {
+				continue
+			}
+			mismatch, err := c.freshenResourceForKey(res, key)
+			if err != nil {
+				return err
+			}
+			if mismatch {
+				invalidate = append(invalidate, key)
 			}
 		}
 		return nil
@@ -1127,6 +1440,104 @@ func (c *cache) Freshen(res *Resource, keys ...string) error {
 	if len(invalidate) > 0 {
 		c.Invalidate(invalidate...)
 	}
+	return nil
+}
+
+// The writer lock covers both the generation/validator check and publication.
+// A Store cannot replace the body between checking its header and updating it.
+func (c *cache) freshenResourceForKey(res *Resource, key string) (bool, error) {
+	hashedKey := hashKey(key)
+	unlock := c.lockKeyWriter(hashedKey)
+	defer unlock()
+	c.beginReservation(hashedKey)
+	defer c.releaseReservation(hashedKey)
+	h, storedAt, meta, proof, err := c.readHeaderProvenance(headerPrefix+formatPrefix+hashedKey, key, true, false)
+	if err != nil {
+		// A newly fetched HEAD has nothing to freshen if no GET is stored.
+		if errors.Is(err, ErrNotFoundInCache) && res.storedAt.IsZero() {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to read freshening target %q: %w", key, err)
+	}
+	if storedAt.IsZero() {
+		storedAt = c.entryStoredAt(hashedKey)
+	}
+	// A Resource retrieved before a replacement cannot refresh that newer
+	// generation even if its weak validators or content length still match.
+	// Freshly fetched HEAD resources have no stored generation. Legacy
+	// resources retain the timestamp fallback for compatibility. Persisted
+	// provenance also catches replacements made by another coordinated cache.
+	if c.resourceWasReplaced(res, hashedKey, storedAt, proof) {
+		return false, fmt.Errorf("freshening target %q was replaced after retrieval", key)
+	}
+	if h.StatusCode != res.Status() || !headersEqual(h.Header, res.Header()) {
+		return true, nil
+	}
+	bodyInfo, err := c.fs.Stat(bodyPrefix + formatPrefix + hashedKey)
+	if err != nil {
+		return false, fmt.Errorf("failed to size freshening target %q: %w", key, err)
+	}
+	freshenedAt := Clock()
+	headerData, err := serializeStoredHeader(h.StatusCode, res.Header(), freshenedAt)
+	if meta != nil {
+		meta.StoredAt = freshenedAt
+		headerData, err = serializeIntegrityHeader(h.StatusCode, res.Header(), *meta)
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to serialize freshening target %q: %w", key, err)
+	}
+	newSize := bodyInfo.Size() + int64(len(headerData))
+	if err := c.reserveEntry(hashedKey, newSize); err != nil {
+		return false, fmt.Errorf("failed to admit freshening target %q: %w", key, err)
+	}
+	if err := c.commitFreshenedHeader(key, hashedKey, headerData, newSize, freshenedAt); err != nil {
+		return false, err
+	}
+	if res.storageGeneration != nil {
+		res.storageGeneration = c.entryGeneration(hashedKey)
+	}
+	if err := c.advanceResourceProvenance(res, key, headerData, freshenedAt); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func (c *cache) resourceWasReplaced(res *Resource, hashedKey string, storedAt time.Time, proof *headerProvenance) bool {
+	if res.storageGeneration != nil && res.storageGeneration != c.entryGeneration(hashedKey) {
+		return true
+	}
+	if !res.storedAt.IsZero() && !storedAt.Equal(res.storedAt) {
+		return true
+	}
+	if previous := res.storageRecord; previous != nil {
+		return previous.fingerprint != proof.fingerprint ||
+			(previous.fileInfo != nil && proof.fileInfo != nil && !os.SameFile(previous.fileInfo, proof.fileInfo))
+	}
+	return false
+}
+
+// Called while the key writer lock and capacity reservation remain held.
+func (c *cache) commitFreshenedHeader(key, hashedKey string, headerData []byte, newSize int64, freshenedAt time.Time) error {
+	// The key writer lock hides generic VFS header replacement from readers.
+	// Native disk readers can continue using the old header during staging.
+	header, _, err := c.stageSerializedHeader(headerData, key)
+	c.publishMu.Lock()
+	defer c.publishMu.Unlock()
+	if err == nil {
+		err = c.commitStagedLocked(header)
+	}
+	if err != nil {
+		c.abandonStaged(header)
+		if anyPublished(header) {
+			if discardErr := c.discardUnadmitted(key, hashedKey, newSize, freshenedAt); discardErr != nil {
+				err = errors.Join(err, discardErr)
+			}
+		}
+		return fmt.Errorf("failed to freshen header for key %q: %w", key, err)
+	}
+	// Header growth consumes real capacity too. Convert this reservation and
+	// advance its persisted generation together in the LRU ledger.
+	c.trackEntry(key, hashedKey, newSize, freshenedAt)
 	return nil
 }
 
@@ -1155,6 +1566,18 @@ func readStoredHeaders(r *bufio.Reader) (Header, time.Time, error) {
 		if err != nil {
 			return Header{}, time.Time{}, fmt.Errorf("malformed cache timestamp: %w", err)
 		}
+		line, err = tp.ReadLine()
+		if err != nil {
+			return Header{}, time.Time{}, err
+		}
+	}
+
+	if strings.HasPrefix(line, integrityPreamble) {
+		meta, parseErr := parseIntegrityPreamble(line)
+		if parseErr != nil {
+			return Header{}, time.Time{}, parseErr
+		}
+		storedAt = meta.StoredAt
 		line, err = tp.ReadLine()
 		if err != nil {
 			return Header{}, time.Time{}, err
@@ -1197,6 +1620,7 @@ func headersToWriter(h http.Header, w io.Writer) error {
 func (c *cache) trackEntry(key, hashedKey string, size int64, storedAt time.Time) {
 	c.lruMutex.Lock()
 	defer c.lruMutex.Unlock()
+	c.releaseReservationLocked(hashedKey)
 
 	if storedAt.IsZero() {
 		storedAt = Clock()
@@ -1209,6 +1633,7 @@ func (c *cache) trackEntry(key, hashedKey string, size int64, storedAt time.Time
 		entry.size = size
 		entry.storedAt = storedAt
 		entry.accessedAt = storedAt
+		entry.generation = new(cacheGeneration)
 		c.totalSize += size
 		// Move to front of LRU list
 		c.lruList.MoveToFront(entry.element)
@@ -1220,11 +1645,21 @@ func (c *cache) trackEntry(key, hashedKey string, size int64, storedAt time.Time
 			size:       size,
 			storedAt:   storedAt,
 			accessedAt: storedAt,
+			generation: new(cacheGeneration),
 		}
 		entry.element = c.lruList.PushFront(entry)
 		c.lruIndex[hashedKey] = entry
 		c.totalSize += size
 	}
+}
+
+func (c *cache) entryGeneration(hashedKey string) *cacheGeneration {
+	c.lruMutex.RLock()
+	defer c.lruMutex.RUnlock()
+	if entry := c.lruIndex[hashedKey]; entry != nil {
+		return entry.generation
+	}
+	return nil
 }
 
 // entryStoredAt reports when this cache last WROTE the entry, at full
@@ -1237,22 +1672,6 @@ func (c *cache) entryStoredAt(hashedKey string) time.Time {
 		return entry.storedAt
 	}
 	return time.Time{}
-}
-
-// markFreshened records that the entry was just validated against the origin.
-//
-// Only the timestamps: the size is unchanged by a freshen, and writing the
-// header's length over it would corrupt the total the size cap is enforced
-// against.
-func (c *cache) markFreshened(hashedKey string, freshenedAt time.Time) {
-	c.lruMutex.Lock()
-	defer c.lruMutex.Unlock()
-
-	if entry, exists := c.lruIndex[hashedKey]; exists {
-		entry.storedAt = freshenedAt
-		entry.accessedAt = freshenedAt
-		c.lruList.MoveToFront(entry.element)
-	}
 }
 
 // touchEntry updates the access time and moves entry to front of LRU list
@@ -1357,19 +1776,54 @@ func (c *cache) removeEntry(entry *cacheEntry) error {
 	return nil
 }
 
-// evictIfNeeded evicts enough least-recently-used items to admit itemSize.
-// It returns an error when removal failures leave insufficient room, so Store
-// never admits another item merely because the first LRU victim is stuck.
-func (c *cache) evictIfNeeded(hashedKey string, itemSize int64) error {
+func (c *cache) beginReservation(hashedKey string) {
+	c.lruMutex.Lock()
+	defer c.lruMutex.Unlock()
+	if c.reservations == nil {
+		c.reservations = make(map[string]int64)
+	}
+	c.reservations[hashedKey] = 0
+}
+
+func (c *cache) reserveEntry(hashedKey string, itemSize int64) error {
+	c.lruMutex.Lock()
+	defer c.lruMutex.Unlock()
+	if err := c.evictForAdmissionLocked(hashedKey, itemSize); err != nil {
+		return err
+	}
+	existingSize := int64(0)
+	if entry := c.lruIndex[hashedKey]; entry != nil {
+		existingSize = entry.size
+	}
+	growth := max(itemSize-existingSize, 0)
+	c.reservedSize += growth - c.reservations[hashedKey]
+	c.reservations[hashedKey] = growth
+	return nil
+}
+
+func (c *cache) releaseReservation(hashedKey string) {
+	c.lruMutex.Lock()
+	defer c.lruMutex.Unlock()
+	c.releaseReservationLocked(hashedKey)
+}
+
+func (c *cache) releaseReservationLocked(hashedKey string) {
+	c.reservedSize -= c.reservations[hashedKey]
+	delete(c.reservations, hashedKey)
+}
+
+// The caller holds lruMutex while checking committed bytes and all other
+// writers' reserved growth. Active keys cannot be evicted to fund admission.
+func (c *cache) evictForAdmissionLocked(hashedKey string, itemSize int64) error {
+	if itemSize < 0 {
+		return fmt.Errorf("cache entry size overflow")
+	}
 	if c.config.MaxSize <= 0 {
 		return nil
 	}
 	if itemSize > c.config.MaxSize {
 		return fmt.Errorf("item size %d exceeds cache size limit %d", itemSize, c.config.MaxSize)
 	}
-
-	c.lruMutex.Lock()
-	defer c.lruMutex.Unlock()
 
 	// Replacing a key reclaims its old tracked size when trackEntry commits the
 	// new value. Protect that entry from eviction (important for an
@@ -1379,7 +1833,10 @@ func (c *cache) evictIfNeeded(hashedKey string, itemSize int64) error {
 	if existing, ok := c.lruIndex[hashedKey]; ok {
 		existingSize = existing.size
 	}
-	targetSize := c.config.MaxSize - itemSize + existingSize
+	otherReserved := c.reservedSize - c.reservations[hashedKey]
+	// This operation may reclaim its own replacement's old bytes. Other
+	// admissions receive no credit for a pending shrink until it commits.
+	targetSize := c.config.MaxSize - otherReserved - itemSize + existingSize
 
 	var removeErr error
 	// Visit each entry at most once, from least to most recently used. A
@@ -1388,7 +1845,8 @@ func (c *cache) evictIfNeeded(hashedKey string, itemSize int64) error {
 	for elem := c.lruList.Back(); c.totalSize > targetSize && elem != nil; {
 		prev := elem.Prev()
 		entry := elem.Value.(*cacheEntry)
-		if entry.hashedKey == hashedKey {
+		_, active := c.reservations[entry.hashedKey]
+		if entry.hashedKey == hashedKey || active {
 			elem = prev
 			continue
 		}
@@ -1549,6 +2007,11 @@ func (c *cache) cleanupTTLExpired(now time.Time) (int, int64, bool) {
 		prev := elem.Prev()
 
 		if entry.storedAt.Before(cutoff) {
+			if _, active := c.reservations[entry.hashedKey]; active {
+				complete = false
+				elem = prev
+				continue
+			}
 			debugf("removing TTL-expired entry: %s (stored: %s)",
 				entry.key, entry.storedAt.Format(time.RFC3339))
 			if err := c.removeEntry(entry); err != nil {
@@ -1582,6 +2045,10 @@ func (c *cache) enforceMaxSize() (int, int64) {
 	for elem := c.lruList.Back(); c.totalSize > c.config.MaxSize && elem != nil; {
 		prev := elem.Prev()
 		entry := elem.Value.(*cacheEntry)
+		if _, active := c.reservations[entry.hashedKey]; active {
+			elem = prev
+			continue
+		}
 		debugf("enforcing max size, removing: %s (size: %d)",
 			entry.key, entry.size)
 		if err := c.removeEntry(entry); err != nil {

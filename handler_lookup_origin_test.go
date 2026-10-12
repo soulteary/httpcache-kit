@@ -298,7 +298,7 @@ func TestLookupVaryOwnershipAndInvalidation(t *testing.T) {
 				h.localStale = map[string]time.Time{baseKey: req.Time}
 			}
 			if tc.newer {
-				h.localFresh = map[string]time.Time{variantKey: req.Time.Add(time.Second)}
+				h.localFresh = map[string]*localFreshProof{variantKey: {at: req.Time.Add(time.Second)}}
 			}
 			got, err := h.lookup(req)
 			if got != variant || !errors.Is(err, tc.wantErr) {

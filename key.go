@@ -3,6 +3,7 @@ package httpcache
 import (
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -46,7 +47,7 @@ func (k Key) Vary(varyHeader string, r *http.Request) Key {
 	k2 := k
 
 	for _, header := range parseVary(varyHeader) {
-		k2.vary = append(k2.vary, header+"="+r.Header.Get(header))
+		k2.vary = append(k2.vary, header+"="+varyFieldKey(r.Header, header))
 	}
 
 	return k2
@@ -108,4 +109,33 @@ func varyWildcard(varyHeader string) bool {
 		}
 	}
 	return false
+}
+
+// Preserve field-line boundaries even for fields (such as Cookie) that cannot
+// be safely normalized by comma joining. Conservative extra misses are safe.
+func varyFieldKey(header http.Header, name string) string {
+	var keys []string
+	for key := range header {
+		if strings.EqualFold(key, name) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	if len(keys) == 0 {
+		return "missing"
+	}
+	var b strings.Builder
+	b.WriteByte('[')
+	first := true
+	for _, key := range keys {
+		for _, value := range header[key] {
+			if !first {
+				b.WriteByte(',')
+			}
+			first = false
+			b.WriteString(strconv.Quote(value))
+		}
+	}
+	b.WriteByte(']')
+	return b.String()
 }

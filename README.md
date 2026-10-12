@@ -17,7 +17,9 @@ Evolved from [lox/httpcache](https://github.com/lox/httpcache) (MIT).
 - **Invalidation**: an unsafe method invalidates the request URI and the URIs named by the response's `Location` / `Content-Location`
 - **Private and shared profiles**: a shared cache refuses `private` responses and strips `private` headers
 - **Memory, disk and VFS backends**: disk storage goes through [vfs-kit](https://github.com/soulteary/vfs-kit)
-- **Bounded**: configurable TTL, max size, cleanup interval, LRU eviction
+- **Bounded**: configurable TTL, max size, cleanup interval, LRU eviction, optional shared temporary-storage admission
+- **Verified persistent entries**: optional SHA256 verification of the body, status, headers and private cache metadata
+- **Application coordination**: trusted logical request keys and optional cross-instance miss ownership
 - **Observable, and only if you ask**: Prometheus metrics live in the `prometheusmetrics` subpackage, so importing the root package does not link Prometheus — debug logging via [logger-kit](https://github.com/soulteary/logger-kit)
 - **Graceful shutdown**: background cache writes are tracked and can be awaited
 
@@ -173,7 +175,8 @@ stale-markers.json        invalidation state
 
 An entry is its body plus its header, and the two are published together by
 rename, so a reader sees the whole previous entry or the whole new one. That
-holds **between goroutines sharing one live cache**, and no further:
+holds **between goroutines sharing one live cache**. Other processes need
+application-provided storage locks:
 
 - The two renames are sequential. A process that exits between them leaves the
   new body beside the old header, and startup removes the leftover staging file
@@ -181,13 +184,110 @@ holds **between goroutines sharing one live cache**, and no further:
 - The lock is per-instance. Two caches opened on one directory do not
   coordinate, and their publications can interleave.
 
-Nothing under `staging/v1` is a cache entry: it is never scanned, and whatever
-an interrupted process left there is removed at startup.
+Nothing under `staging/v1` is a cache entry: it is never scanned. Startup
+removes interrupted stages by default. Set `DisableStagingSweep: true` when
+multiple live instances share a directory, so one does not remove another
+instance's active files. That mode requires offline orphan cleanup with all
+instances stopped; it provides no automatic crash orphan reclamation.
 
 Only `body/v1` and `header/v1` count toward `MaxSize` and `Stats().TotalSize`.
 The other `Stats()` fields are independent of these directories —
 `StaleCount` tracks `stale-markers.json`, and `HitCount`/`MissCount` are
 counters.
+
+
+## Integrity, staging admission and fill ownership
+
+These options are additive and disabled by default:
+
+```go
+cfg := httpcache.DefaultCacheConfig()
+cfg.Integrity = httpcache.IntegritySHA256
+cfg.StagingBudget = applicationBudget
+cache, err := httpcache.NewDiskCacheWithConfig("/var/cache/myproxy", cfg)
+// Handle err before using cache.
+handler := httpcache.NewHandlerWithOptions(cache, proxy, &httpcache.HandlerOptions{
+    StagingBudget: applicationBudget, // the same budget counts overlapping copies
+    TempDir: "/var/cache/myproxy-tmp",
+    RequestKey: trustedRepositoryKey,
+    MissCoordinator: applicationFillLocks,
+})
+handler.Shared = true
+```
+
+`IntegritySHA256` writes a private `HTTPCACHE/2` preamble with body SHA256,
+body size, key SHA256 and a digest binding the serialized HTTP status/headers
+and private metadata, including the exact generation timestamp. It verifies the
+record and reads the entire body before returning a cache hit. Legacy entries
+without that private digest become misses; an origin `Digest` header does not
+substitute for it. Corruption removes only the observed key generation and the
+handler refetches it. `Freshen` retains the original body digest while updating
+the header generation. Mixed body/header versions left by interrupted
+publication are rejected. Private metadata never appears in HTTP responses.
+This detects accidental corruption, not authenticity against an attacker who
+can rewrite the files and recompute SHA256. Verification adds a full body read
+to each retrieval, so applications should select it according to their storage
+and performance needs. Existing verified entries are still verified when read
+with the default mode; new writes in that mode use the legacy format.
+
+`StagingBudget.NewLease(ctx, kind)` creates one temporary-copy lease.
+`Reserve(bytes)` must be nonblocking, thread-safe and all-or-nothing;
+`Release(bytes)` refunds an unused reservation and idempotent `Close()` releases
+all retained bytes. Use `errors.Is(err, httpcache.ErrStagingBudgetExceeded)` to
+recognize refused cache staging. The handler charges `StageHandlerBody` until
+its asynchronous Store completes. Native disk storage charges `StageCacheBody`
+and `StageCacheHeader` until publication or successful deletion, including when
+the file descriptor has already closed. A failed deletion retains its charge.
+The same budget can cover application spools by using the same interface.
+On Linux/macOS the handler unlinks its file before writing and retains its live
+descriptor, so process exit leaves no named response copy. Windows uses a named
+file and removes it on close. Refused handler admission drains the remaining
+origin stream so the client receives the complete response; refused backend
+admission leaves the previous committed entry intact. Persistent entries use
+`MaxSize`; marker journals and custom VFS write buffers are outside this hook.
+A custom VFS must account for its own buffers. `StoreContext` cooperatively
+checks cancellation between reads/writes; it cannot interrupt an arbitrary
+blocking Reader or VFS call.
+
+`NewVFSCache` requires open readers to retain their contents when the same
+path is rewritten. The memory backend provides this behavior. For ordinary
+OS files, use `NewDiskCache`: its atomic rename preserves already-open readers.
+Generic VFS publication serializes opening readers with same-key writes;
+it cannot provide immutable snapshots for custom mutable file handles.
+
+With a handler staging budget, admission refused before streaming is reported
+in the initial `X-Cache: SKIP` header. An admitted HTTP/1.1 or HTTP/2 response
+with a body declares the `X-Cache-Staging` trailer: read the complete body to
+observe `ADMITTED` or a later `SKIP` caused by refused reservation or failed
+temporary storage. This reports only handler-body staging; asynchronous cache
+Store can still fail afterward. HTTP/1.1 budgeted responses use chunked framing
+instead of the origin's `Content-Length`; the cached origin metadata is retained.
+HTTP/1.0 budgeted responses bypass staging and report `X-Cache: SKIP`, since that
+protocol cannot transmit the final trailer. Budgeted HEAD and origin responses
+with a bodyless status also bypass staging and report `SKIP`. Cached hits remain
+available; responses without a handler budget retain their framing.
+
+`RequestKey` is a trusted callback returning a `Key`; it changes cache identity
+without changing the upstream URL. Preserve method and Vary separation and
+merge only independently verified identical objects. Never let an untrusted
+request header choose a different object's key. Unsafe-method invalidation uses
+the policy for the effective URI and same-origin Location/Content-Location
+only. A key-policy error rejects the request with 400.
+
+`MissCoordinator.Acquire(ctx, key)` waits for exclusive fill ownership. The
+handler rechecks storage after acquisition and holds the returned `MissLease`
+through asynchronous publication or every skip/error exit. Waiting acquisition
+must honor cancellation; failure returns 503 without issuing an uncoordinated
+upstream fill. Lease `Context()` carries ownership/fencing values and derives
+from the acquisition context; `Close()` must be bounded and idempotent.
+`ContextStore` receives those values via `context.WithoutCancel` during background
+writes, so a completed client does not cancel publication. The backend must
+independently bound I/O and enforce ownership/fencing. The hook itself supplies
+no distributed lock, cross-process storage atomicity, shared LRU ledger or
+backend lease fencing. Shared disk requires storage-operation locks and
+`DisableStagingSweep`; expiring remote leases additionally require fenced
+publication. Invalidation and revalidation are storage operations rather than
+miss fills and must be protected by the application's storage locking too.
 
 ## Configuration
 
@@ -320,7 +420,7 @@ on := httpcache.IsDebugLogging()
 | Header | Values | Meaning |
 |--------|--------|---------|
 | `X-Cache` | `HIT` | served from cache |
-| | `MISS` | fetched from upstream and stored |
+| | `MISS` | fetched from upstream; storage depends on admission and background write success |
 | | `SKIP` | not cacheable, or cache bypassed |
 | `Proxy-Date` | HTTP-date | when this cache received the response |
 

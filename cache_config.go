@@ -18,6 +18,17 @@ const DefaultStaleMapTTL = 24 * time.Hour
 
 // CacheConfig holds configuration for cache behavior
 type CacheConfig struct {
+	// IntegritySHA256 requires persisted body/metadata checksums. Legacy or
+	// damaged entries become misses; this detects corruption, not authenticity.
+	Integrity IntegrityMode
+	// StagingBudget accounts for native disk staging until commit or deletion.
+	// A custom VFS must account for its own memory/disk write buffers.
+	StagingBudget StagingBudget
+	// DisableStagingSweep is required when multiple live caches share a disk
+	// root. Startup must not delete another instance's active staging files.
+	// In that mode crash orphans require offline cleanup with all instances stopped.
+	DisableStagingSweep bool
+
 	// MaxSize is the maximum size of the cache in bytes.
 	// When exceeded, the oldest items will be evicted (LRU).
 	// Set to 0 to disable size-based eviction.

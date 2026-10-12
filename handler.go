@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,9 @@ import (
 const (
 	CacheHeader     = "X-Cache"
 	ProxyDateHeader = "Proxy-Date"
+	// CacheStagingHeader reports synchronous handler-body staging admission.
+	// It does not report the result of the subsequent asynchronous cache Store.
+	CacheStagingHeader = "X-Cache-Staging"
 )
 
 var Writes sync.WaitGroup
@@ -51,6 +55,17 @@ var cacheableByDefault = map[int]bool{
 // if nil, the package-level logger (see SetLogger) is used.
 type HandlerOptions struct {
 	Logger *logger.Logger
+	// StagingBudget accounts for the response copy retained through Store.
+	StagingBudget StagingBudget
+	// TempDir selects the handler staging directory; empty uses os.TempDir.
+	TempDir string
+	// RequestKey is a trusted application policy for logical identities. It
+	// must preserve method and Vary separation and may only merge URLs whose
+	// content identity the application has independently verified. It never
+	// changes the upstream request URL. Errors reject the request with 400.
+	RequestKey func(*http.Request) (Key, error)
+	// MissCoordinator optionally serializes fills across handler instances.
+	MissCoordinator MissCoordinator
 
 	// StaleMarkerTTL is how long the handler remembers an invalidation for a
 	// Cache that does not implement StaleAt itself.
@@ -74,12 +89,16 @@ type Handler struct {
 	// Authorization header are storable. Deploying a shared cache without
 	// setting this serves one user's response to another. Prefer
 	// NewSharedHandler, which cannot be forgotten.
-	Shared    bool
-	upstream  http.Handler
-	validator *Validator
-	cache     Cache
-	metrics   Metrics
-	log       *logger.Logger
+	Shared          bool
+	upstream        http.Handler
+	validator       *Validator
+	cache           Cache
+	metrics         Metrics
+	log             *logger.Logger
+	stagingBudget   StagingBudget
+	tempDir         string
+	requestKey      func(*http.Request) (Key, error)
+	missCoordinator MissCoordinator
 
 	lifecycleMu sync.Mutex
 	writes      sync.WaitGroup
@@ -96,7 +115,10 @@ type Handler struct {
 	// third-party Cache. Such a cache may return Resources without SetStoredAt,
 	// leaving only second-granular HTTP dates; a validation in the same second
 	// as a mutation would otherwise remain stale for the marker's lifetime.
-	localFresh map[string]time.Time
+	localFresh map[string]*localFreshProof
+	// localPublications bind fallback freshness evidence to
+	// a stable retrieval, even when an opaque backend completes writes late.
+	localPublications map[string]*localPublication
 	// localStaleTTL is how long those markers are kept; see
 	// HandlerOptions.StaleMarkerTTL.
 	localStaleTTL time.Duration
@@ -143,6 +165,10 @@ func NewHandlerWithOptions(cache Cache, upstream http.Handler, opts *HandlerOpti
 	}
 	if opts != nil && opts.StaleMarkerTTL > 0 {
 		h.localStaleTTL = opts.StaleMarkerTTL
+	}
+	if opts != nil {
+		h.stagingBudget, h.tempDir = opts.StagingBudget, opts.TempDir
+		h.requestKey, h.missCoordinator = opts.RequestKey, opts.MissCoordinator
 	}
 	return h
 }
@@ -195,6 +221,13 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			http.StatusBadRequest)
 		return
 	}
+	if h.requestKey != nil {
+		cReq.Key, err = h.requestKey(r)
+		if err != nil {
+			http.Error(rw, "invalid cache identity", http.StatusBadRequest)
+			return
+		}
+	}
 
 	if !cReq.isCacheable() {
 		h.debugf("request not cacheable")
@@ -242,26 +275,34 @@ func (h *Handler) resolveMiss(rw http.ResponseWriter, cReq *cacheRequest) (*Reso
 	if h.metrics != nil {
 		h.metricsRef().RecordCacheMiss(cReq.Method)
 	}
-	flight, leader := h.claimMiss(cReq.Key.String())
-	if leader {
-		h.passUpstream(rw, cReq, func() { h.finishMiss(cReq.Key.String(), flight) })
-		return nil, false
-	}
-
-	select {
-	case <-flight.done:
-		res, err := h.lookup(cReq)
-		if err != nil {
-			// The leader could not cache the response. Fall through to an
-			// uncoupled upstream request so followers are never stranded.
-			h.passUpstream(rw, cReq, nil)
+	for {
+		if cReq.Context().Err() != nil {
 			return nil, false
 		}
-		// Invalidation may race the leader's completed Store and mark this
-		// response stale before the follower wakes. Do not bypass validation.
-		return res, true
-	case <-cReq.Context().Done():
-		return nil, false
+		flight, leader := h.claimMiss(cReq.Key.String())
+		if leader {
+			return h.leadMiss(rw, cReq, func() { h.finishMiss(cReq.Key.String(), flight) })
+		}
+
+		select {
+		case <-flight.done:
+			res, err := h.recheckMiss(cReq)
+			if err == nil {
+				// An invalidation can race the leader's completed Store. Return
+				// through the ordinary hit checks rather than bypass validation.
+				return res, true
+			}
+			if h.missCoordinator != nil {
+				// The leader could not store this response. Compete for a new
+				// coordinated fill without growing the stack or recording this
+				// client's original miss again after every other failed fill.
+				continue
+			}
+			h.passUpstream(rw, cReq, nil)
+			return nil, false
+		case <-cReq.Context().Done():
+			return nil, false
+		}
 	}
 }
 
@@ -295,19 +336,31 @@ func (h *Handler) validateCachedResponse(rw http.ResponseWriter, cReq *cacheRequ
 	}
 
 	h.debugf("validating cached response")
-	if !h.validator.Validate(cReq.Request, res) {
+	previousVary := combinedHeaderValues(res.Header(), "Vary")
+	valid, served := h.validateUpstreamResponse(rw, cReq, res)
+	if served {
+		_ = res.Close()
+		return false
+	}
+	if !valid {
 		h.debugf("response is changed")
 		h.refetchCachedResponse(rw, cReq, res)
 		return false
 	}
 	h.debugf("response is valid")
 	keys := cReq.validationKeys()
-	if !h.isCacheable(res, cReq) {
+	varyChanged := !sameVaryFields(previousVary, combinedHeaderValues(res.Header(), "Vary"))
+	if !h.isCacheable(res, cReq) || varyChanged {
 		// A 304 can withdraw permission to reuse the stored response. Do not
 		// freshen a formerly public object or leave the old policy available.
-		h.recordStale(keys...)
-		h.cache.Invalidate(keys...)
-		h.refetchCachedResponse(rw, cReq, res)
+		// A changed Vary field set also needs a full Store to rebuild both the
+		// base discovery entry and the variant key. Keep old keys stale even
+		// if that refetch fails, rather than refreshing the old selection rule.
+		if varyChanged {
+			h.refetchChangedVaryResponse(rw, cReq, res)
+		} else {
+			h.refetchCachedResponse(rw, cReq, res)
+		}
 		return false
 	}
 	if h.Shared {
@@ -322,12 +375,23 @@ func (h *Handler) validateCachedResponse(rw http.ResponseWriter, cReq *cacheRequ
 	return true
 }
 
+func sameVaryFields(first, second string) bool {
+	firstFields, secondFields := parseVary(first), parseVary(second)
+	slices.Sort(firstFields)
+	slices.Sort(secondFields)
+	return slices.Equal(slices.Compact(firstFields), slices.Compact(secondFields))
+}
+
 func (cReq *cacheRequest) validationKeys() []string {
-	// Freshen both the base key and the variant that lookup actually retrieved.
+	// Include the actual discovery key: HEAD can retrieve GET and then select
+	// its Vary variant, so the request key alone does not fence other variants.
 	// Otherwise the variant's older Proxy-Date makes it stale again on every
 	// subsequent request until the base invalidation marker is swept.
 	keys := []string{cReq.Key.String()}
-	if cReq.servedKey != "" && cReq.servedKey != keys[0] {
+	if cReq.discoveryKey != "" && cReq.discoveryKey != keys[0] {
+		keys = append(keys, cReq.discoveryKey)
+	}
+	if cReq.servedKey != "" && !slices.Contains(keys, cReq.servedKey) {
 		keys = append(keys, cReq.servedKey)
 	}
 	return keys
@@ -335,11 +399,57 @@ func (cReq *cacheRequest) validationKeys() []string {
 
 func (h *Handler) refetchCachedResponse(rw http.ResponseWriter, cReq *cacheRequest, res *Resource) {
 	_ = res.Close()
-	h.passUpstream(rw, cReq, nil)
+	h.refetchOriginalResponse(rw, cReq)
+}
+
+func (h *Handler) fenceValidationKeys(cReq *cacheRequest) {
+	keys := cReq.validationKeys()
+	h.recordStale(keys...)
+	h.cache.Invalidate(keys...)
+}
+
+func (h *Handler) refetchOriginalResponse(rw http.ResponseWriter, cReq *cacheRequest) {
+	h.fenceValidationKeys(cReq)
+	refetch := *cReq
+	refetch.Time = Clock()
+	h.passUpstream(rw, &refetch, nil)
+}
+
+func (h *Handler) refetchChangedVaryResponse(rw http.ResponseWriter, cReq *cacheRequest, res *Resource) {
+	vary := combinedHeaderValues(res.Header(), "Vary")
+	_ = res.Close()
+	h.refetchVaryResponse(rw, cReq, vary)
+}
+
+// refetchVaryResponse leaves closing the selected Resource to its caller.
+// Full validation responses supply the replacement policy, not the old one.
+func (h *Handler) refetchVaryResponse(rw http.ResponseWriter, cReq *cacheRequest, vary string) {
+	if varyUsesClientValidators(vary) {
+		// Removing a varied condition changes which representation the origin
+		// selects. Preserve it, even when a 304 leaves no body to rebuild with.
+		h.refetchOriginalResponse(rw, cReq)
+		return
+	}
+	h.fenceValidationKeys(cReq)
+	// Rebuilding the index needs a body even when the client's validators
+	// match. Preserve other preconditions and Range at the origin, while the
+	// delivery writer applies the original matching conditions to the client.
+	fetch := cReq.Clone(cReq.Context())
+	fetch.Header.Del("If-None-Match")
+	fetch.Header.Del("If-Modified-Since")
+	// Vary must describe the request that produced the stored response. Keep
+	// the original base/policy identity, but select its variant from the
+	// unconditional fetch rather than the client's removed validators.
+	// The old keys were just invalidated. Record the rebuild after that
+	// barrier for third-party caches tracked through localFresh as well.
+	rebuilt := *cReq
+	rebuilt.Request = fetch // Storage variants must describe the headers sent upstream.
+	rebuilt.Time = Clock()
+	h.streamVaryRebuild(rw, &rebuilt, cReq.Request)
 }
 
 func (h *Handler) freshenValidatedResponse(res *Resource, keys []string) bool {
-	if err := h.cache.Freshen(res, keys...); err != nil {
+	if err := h.freshenResource(res, keys...); err != nil {
 		// The validation may have raced a newer invalidation, or the cache may
 		// have failed to persist it. Fetch the current representation in full.
 		h.debugf("freshening cached response failed: %v", err)
@@ -357,7 +467,6 @@ func (h *Handler) freshenValidatedResponse(res *Resource, keys []string) bool {
 	}
 	// Validator records when the conditional request began. cReq.Time predates
 	// lookup and can precede a mutation even if validation itself began after it.
-	h.recordFresh(res.RequestTime, keys...)
 	// Freshen advances the persisted generation, but cannot clear lookup's
 	// stale flag on this Resource. Clear it only after the ordered update so a
 	// successfully validated response does not carry Warning: 110.
@@ -402,6 +511,11 @@ func (h *Handler) freshness(res *Resource, r *cacheRequest) (time.Duration, erro
 }
 
 func (h *Handler) needsValidation(res *Resource, r *cacheRequest) bool {
+	// An explicit invalidation withdraws this representation. max-stale can
+	// relax natural expiration, but cannot make an invalidated body reusable.
+	if res.IsStale() {
+		return true
+	}
 	freshness, err := h.freshness(res, r)
 	if err != nil {
 		h.debugf("error calculating freshness: %s", err.Error())
@@ -496,116 +610,109 @@ func (h *Handler) pipeUpstream(w http.ResponseWriter, r *cacheRequest) {
 	}
 
 	res := rw.Resource()
+	res.RequestTime = r.Time
 	defer func() { _ = res.Close() }()
 
-	_ = h.cache.Freshen(res, r.Key.ForMethod("GET").String())
+	_ = h.freshenResource(res, r.Key.ForMethod("GET").String())
 }
 
 // passUpstream makes the request via the upstream handler and stores the result
 // It uses streaming to avoid loading the entire response into memory for large files.
 func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest, complete func()) {
+	h.passUpstreamWithHandler(w, r, complete, h.upstream, Clock())
+}
+
+func (h *Handler) passUpstreamWithHandler(w http.ResponseWriter, r *cacheRequest, complete func(), upstream http.Handler, startedAt time.Time) {
 	rw, err := newResponseStreamer(w)
 	if err != nil {
 		defer callComplete(complete)
 		h.debugf("error creating response streamer: %v", err)
 		w.Header().Set(CacheHeader, "SKIP")
-		h.upstream.ServeHTTP(w, r.Request)
+		upstream.ServeHTTP(w, r.Request)
 		return
+	}
+	if h.stagingBudget != nil {
+		rw.deferHeaders = true
+		rw.retainHeader = true
+		if deferred, ok := w.(interface {
+			DeferStagingHeaders()
+			FinishStagingHeaders()
+		}); ok {
+			deferred.DeferStagingHeaders()
+			defer deferred.FinishStagingHeaders()
+		}
 	}
 	rdr, err := rw.NextReader()
 	if err != nil {
 		defer callComplete(complete)
 		h.debugf("error creating next stream reader: %v", err)
 		w.Header().Set(CacheHeader, "SKIP")
-		h.upstream.ServeHTTP(w, r.Request)
+		upstream.ServeHTTP(w, r.Request)
 		return
 	}
 
-	t := Clock()
+	t := startedAt
 	h.debugf("passing request upstream")
 	rw.Header().Set(CacheHeader, "MISS")
 
 	go func() {
-		h.upstream.ServeHTTP(rw, r.Request)
+		upstream.ServeHTTP(rw, r.Request)
 		_ = rw.Close()
 	}()
 	rw.WaitHeaders()
 	h.debugf("upstream responded headers in %s", Clock().Sub(t).String())
 
-	// just the headers! Use a clone so storeResource can mutate (e.g. RemovePrivateHeaders) without racing with the client reading rw.Header().
-	res := NewResourceBytes(rw.StatusCode, nil, rw.Header().Clone())
+	// The committed snapshot is immutable. The live header map can already be
+	// receiving trailer updates, even when the response has no body.
+	res := NewResourceBytes(rw.StatusCode, nil, rw.responseHeader.Clone())
 	// Store the precise local start of this upstream fetch. The cache uses it
 	// to order an in-flight response against a concurrent invalidation without
 	// relying on second-granular HTTP dates.
 	res.RequestTime = t
-	if !h.isCacheable(res, r) {
+	if !h.canStageResponse(res, r) {
 		h.debugf("resource is uncacheable")
-		rw.Header().Set(CacheHeader, "SKIP")
+		rw.commitStagingHeaders(r.Request, "SKIP", false)
 		// Drain body so upstream goroutine can finish and client receives the response
 		_, _ = io.Copy(io.Discard, rdr)
 		_ = rdr.Close()
+		// The upstream has finished before the pipe closes, so changing the
+		// wrapped live headers here cannot race trailer publication.
+		rw.Header().Set(CacheHeader, "SKIP")
+		rw.finishStaging("SKIP")
 		callComplete(complete)
 		return
 	}
 
-	// Create temporary file to store body for caching (supports multiple reads for multiple keys)
-	tmpFile, err := os.CreateTemp("", "httpcache-*.tmp")
+	stage, err := newHandlerStage(r.Context(), h.tempDir, h.stagingBudget)
+	rw.commitStagingHeaders(r.Request, "MISS", err == nil)
+	if err == nil {
+		_, err = io.Copy(&stagingWriter{ctx: r.Context(), w: stage.File, lease: stage.lease}, rdr)
+	}
 	if err != nil {
-		h.debugf("error creating temp file: %v, skipping cache", err)
-		// Keep draining the stream so the client receives the complete response,
-		// but never fall back to an unbounded in-memory copy.
-		_, err := io.Copy(io.Discard, rdr)
-		_ = rdr.Close()
-		if err != nil {
-			h.debugf("error reading stream: %v", err)
+		h.debugf("temporary response storage unavailable: %v, skipping cache", err)
+		if stage != nil {
+			_ = stage.Close()
 		}
-		rw.Header().Set(CacheHeader, "SKIP")
-		callComplete(complete)
-		return
-	}
-	tmpPath := tmpFile.Name()
-
-	// Since responseStreamer.Write already writes to both pipeWriter (for pipeReader) and ResponseWriter (client),
-	// the client is already receiving data. We read from pipeReader and write to temp file for caching.
-	// This allows us to cache without blocking the client response.
-	_, err = io.Copy(tmpFile, rdr)
-	if err != nil {
-		h.debugf("error copying to temp file: %v", err)
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpPath)
+		// Reserve never waits: drain the pipe to finish delivering the complete
+		// origin response even when overlapping copies exhaust the budget.
+		_, _ = io.Copy(io.Discard, rdr)
 		_ = rdr.Close()
 		rw.Header().Set(CacheHeader, "SKIP")
-		callComplete(complete)
-		return
-	}
-
-	// Close temp file for writing
-	if err := tmpFile.Close(); err != nil {
-		h.debugf("error closing temp file: %v", err)
-		_ = os.Remove(tmpPath)
-		_ = rdr.Close()
-		rw.Header().Set(CacheHeader, "SKIP")
+		rw.finishStaging("SKIP")
 		callComplete(complete)
 		return
 	}
 	_ = rdr.Close()
-
-	upstreamDuration := Clock().Sub(t)
-	h.debugf("full upstream response took %s", upstreamDuration.String())
-
-	// Create Resource from temp file for caching
-	tmpFileReader, err := os.Open(tmpPath)
-	if err != nil {
-		h.debugf("error reopening temp file for caching: %v", err)
-		_ = os.Remove(tmpPath)
+	if _, err := stage.Seek(0, io.SeekStart); err != nil {
+		_ = stage.Close()
 		rw.Header().Set(CacheHeader, "SKIP")
+		rw.finishStaging("SKIP")
 		callComplete(complete)
 		return
 	}
-
-	// Create a ReadSeekCloser from temp file
-	// The temp file will be cleaned up after caching is complete
-	res.ReadSeekCloser = &tempFileReadSeekCloser{file: tmpFileReader, path: tmpPath}
+	rw.finishStaging("ADMITTED")
+	upstreamDuration := Clock().Sub(t)
+	res.ReadSeekCloser = stage
 
 	// Record upstream duration metric
 	if h.metrics != nil {
@@ -626,6 +733,18 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest, complete 
 
 	// Store resource in background - errors won't affect client response
 	h.storeResource(res, r, complete)
+}
+
+func (h *Handler) canStageResponse(res *Resource, r *cacheRequest) bool {
+	// Protocols/statuses without body trailers cannot convey a later Reserve
+	// refusal. Avoid staging a body whose final outcome could be invisible.
+	return (h.stagingBudget == nil || canConveyStaging(r.Request, res.Status())) && h.isCacheable(res, r)
+}
+
+func canConveyStaging(req *http.Request, status int) bool {
+	return req.ProtoAtLeast(1, 1) && req.Method != http.MethodHead &&
+		status >= http.StatusOK && status != http.StatusNoContent &&
+		status != http.StatusResetContent && status != http.StatusNotModified
 }
 
 func callComplete(complete func()) {
@@ -724,7 +843,7 @@ func (h *Handler) allowsResponseStorage(res *Resource, r *cacheRequest, cc Cache
 	if cc.Has("no-cache") || cc.Has("no-store") {
 		return false
 	}
-	if varyWildcard(res.Header().Get("Vary")) {
+	if varyWildcard(combinedHeaderValues(res.Header(), "Vary")) {
 		return false
 	}
 
@@ -784,6 +903,7 @@ func (h *Handler) serveResource(res *Resource, w http.ResponseWriter, req *cache
 
 	// hacky handler for non-ok statuses
 	if res.Status() != http.StatusOK {
+		w = newClientPreconditionWriter(w, req.Request)
 		w.WriteHeader(res.Status())
 		_, _ = io.Copy(w, res)
 	} else {
@@ -798,7 +918,7 @@ func (h *Handler) serveResource(res *Resource, w http.ResponseWriter, req *cache
 // been POSTed to, PUT or DELETEd kept being served from cache until its own
 // freshness lifetime ran out.
 func (h *Handler) invalidateResource(res *Resource, r *cacheRequest) {
-	keys := invalidationKeys(res, r)
+	keys := h.invalidationKeys(res, r)
 	if len(keys) == 0 {
 		return
 	}
@@ -840,42 +960,12 @@ func (h *Handler) recordStale(keys ...string) {
 		}
 	}
 	for key, at := range h.localFresh {
-		if at.Before(cutoff) {
+		if at.at.Before(cutoff) {
 			delete(h.localFresh, key)
 		}
 	}
 	for _, key := range keys {
 		h.localStale[key] = now
-	}
-}
-
-// recordFresh notes the precise generation represented by keys when the
-// Cache cannot expose one itself. at is the start of the upstream fetch or
-// validation, rather than its completion, so an operation already in flight
-// when a mutation occurs cannot make older content appear newer.
-func (h *Handler) recordFresh(at time.Time, keys ...string) {
-	if _, ok := h.cache.(staleAtChecker); ok {
-		return
-	}
-	if at.IsZero() {
-		at = Clock()
-	}
-
-	cutoff := Clock().Add(-h.staleMarkerTTL())
-	h.localStaleMu.Lock()
-	defer h.localStaleMu.Unlock()
-	if h.localFresh == nil {
-		h.localFresh = make(map[string]time.Time)
-	}
-	for key, recordedAt := range h.localFresh {
-		if recordedAt.Before(cutoff) {
-			delete(h.localFresh, key)
-		}
-	}
-	for _, key := range keys {
-		if previous, ok := h.localFresh[key]; !ok || at.After(previous) {
-			h.localFresh[key] = at
-		}
 	}
 }
 
@@ -889,7 +979,7 @@ func (h *Handler) locallyFreshAfter(key string, staleAt time.Time) bool {
 	h.localStaleMu.Lock()
 	defer h.localStaleMu.Unlock()
 	at, ok := h.localFresh[key]
-	return ok && at.After(staleAt)
+	return ok && at.at.After(staleAt)
 }
 
 // resourceFreshAfter uses the generation evidence owned by the component that
@@ -901,7 +991,7 @@ func (h *Handler) resourceFreshAfter(res *Resource, key string, staleAt time.Tim
 	if _, ok := h.cache.(staleAtChecker); ok {
 		return res.StoredAfter(staleAt)
 	}
-	return h.locallyFreshAfter(key, staleAt)
+	return res.handlerStoredAt.After(staleAt)
 }
 
 // staleAt reports when key was invalidated, from whichever record exists.
@@ -993,17 +1083,17 @@ func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func())
 		}
 
 		// store a secondary vary version
-		if vary := headers.Get("Vary"); vary != "" {
+		if vary := combinedHeaderValues(headers, "Vary"); vary != "" {
 			keys = append(keys, r.Key.Vary(vary, r.Request).String())
 		}
 
-		if err := h.cache.Store(res, keys...); err != nil {
+		err := h.publishResource(context.WithoutCancel(r.Context()), res, r.Time, keys...)
+		if err != nil {
 			h.errorf("storing resources %#v failed with error: %s", keys, err.Error())
 			if h.metrics != nil {
 				h.metricsRef().RecordStoreOperation(false)
 			}
 		} else {
-			h.recordFresh(r.Time, keys...)
 			if h.metrics != nil {
 				h.metricsRef().RecordStoreOperation(true)
 			}
@@ -1047,11 +1137,40 @@ type staleSnapshotChecker interface {
 // lookupResource finds the best matching Resource for the
 // request, or nil and ErrNotFoundInCache if none is found
 func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
-	res, lookupKey, err := h.lookupBaseResource(req)
+	return h.lookupUsing(req, h.cache.Retrieve)
+}
+
+// cacheRechecker lets wrappers opt into quiet internal lookups while leaving
+// the public Cache interface and legacy cache accounting unchanged.
+type cacheRechecker interface {
+	RetrieveForRecheck(string) (*Resource, error)
+}
+
+// coordinationRetriever preserves the built-in cache's package-private path.
+type coordinationRetriever interface {
+	retrieveUncounted(string) (*Resource, error)
+}
+
+func (h *Handler) recheckMiss(req *cacheRequest) (*Resource, error) {
+	retrieve := h.cache.Retrieve
+	if cache, ok := h.cache.(cacheRechecker); ok {
+		retrieve = cache.RetrieveForRecheck
+	} else if cache, ok := h.cache.(coordinationRetriever); ok {
+		retrieve = cache.retrieveUncounted
+	}
+	return h.lookupUsing(req, retrieve)
+}
+
+func (h *Handler) lookupUsing(req *cacheRequest, retrieve func(string) (*Resource, error)) (*Resource, error) {
+	retrieve = h.generationRetriever(retrieve)
+	// A miss retry can select a different base or Vary policy.
+	req.discoveryKey, req.servedKey = "", ""
+	res, lookupKey, err := h.lookupBaseUsing(req, retrieve)
 	if err != nil {
 		return res, err
 	}
 	baseKey := lookupKey.String()
+	req.discoveryKey = baseKey
 
 	// A third-party Cache can complete a pre-mutation background Store after
 	// its own Invalidate call. The handler's generation record is what prevents
@@ -1060,23 +1179,28 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 	// check is harmless for them as well.
 	h.markInvalidatedResource(res, baseKey, baseKey, false)
 
-	if vary := res.Header().Get("Vary"); vary != "" {
-		return h.lookupVaryResource(req, res, lookupKey, vary)
+	if vary := combinedHeaderValues(res.Header(), "Vary"); vary != "" {
+		return h.lookupVaryResource(req, res, lookupKey, vary, retrieve)
 	}
 	return res, nil
 }
 
 // lookupBaseResource also applies the narrower GET-to-HEAD fallback policy.
 func (h *Handler) lookupBaseResource(req *cacheRequest) (*Resource, Key, error) {
+	return h.lookupBaseUsing(req, h.generationRetriever(h.cache.Retrieve))
+}
+
+func (h *Handler) lookupBaseUsing(req *cacheRequest, retrieve func(string) (*Resource, error)) (*Resource, Key, error) {
+	req.discoveryKey, req.servedKey = "", ""
 	lookupKey := req.Key
 	baseKey := lookupKey.String()
-	res, err := h.cache.Retrieve(baseKey)
+	res, err := retrieve(baseKey)
 
 	// HEAD requests can possibly be served from GET
 	if err == ErrNotFoundInCache && req.Method == "HEAD" {
 		lookupKey = req.Key.ForMethod("GET")
 		baseKey = lookupKey.String()
-		res, err = h.cache.Retrieve(baseKey)
+		res, err = retrieve(baseKey)
 		if err != nil {
 			return nil, lookupKey, err
 		}
@@ -1089,10 +1213,13 @@ func (h *Handler) lookupBaseResource(req *cacheRequest) (*Resource, Key, error) 
 			return nil, lookupKey, ErrNotFoundInCache
 		}
 	}
+	if err == nil {
+		req.discoveryKey = baseKey
+	}
 	return res, lookupKey, err
 }
 
-func (h *Handler) lookupVaryResource(req *cacheRequest, base *Resource, lookupKey Key, vary string) (*Resource, error) {
+func (h *Handler) lookupVaryResource(req *cacheRequest, base *Resource, lookupKey Key, vary string, retrieve func(string) (*Resource, error)) (*Resource, error) {
 	if varyWildcard(vary) {
 		_ = base.Close()
 		return nil, ErrNotFoundInCache
@@ -1101,7 +1228,7 @@ func (h *Handler) lookupVaryResource(req *cacheRequest, base *Resource, lookupKe
 	baseStale := base.IsStale()
 	baseKey := lookupKey.String()
 	variantKey := lookupKey.Vary(vary, req.Request).String()
-	varied, err := h.cache.Retrieve(variantKey)
+	varied, err := retrieve(variantKey)
 	// The primary entry is not the one we serve, and nothing else will
 	// close it. Releasing it here is what keeps the disk backend from
 	// leaking a file handle on every Vary lookup.
@@ -1121,6 +1248,13 @@ func (h *Handler) lookupVaryResource(req *cacheRequest, base *Resource, lookupKe
 // not accidentally make the other variants fresh again. Cache-provided markers
 // take precedence over the base entry's stale flag.
 func (h *Handler) markInvalidatedResource(res *Resource, resourceKey, baseKey string, baseStale bool) {
+	// Validation fences only its selected variant. An opaque cache may still
+	// return that old entry as fresh, so enforce its independent marker too.
+	if resourceKey != baseKey {
+		if staleAt, marked := h.staleAt(resourceKey); marked && !h.resourceFreshAfter(res, resourceKey, staleAt) {
+			res.MarkStale()
+		}
+	}
 	if staleAt, marked := h.staleAt(baseKey); marked {
 		// StoredAfter, not ReceivedAfter: HTTP dates are second-granular and
 		// the marker is not, so a same-second revalidation must still clear it.
@@ -1138,9 +1272,9 @@ type cacheRequest struct {
 	Time         time.Time
 	CacheControl CacheControl
 
-	// servedKey is the key lookup actually retrieved, which differs from Key
-	// when a Vary variant was selected.
-	servedKey string
+	// discoveryKey records the actual base used by lookup, including the GET
+	// fallback for HEAD; servedKey records its selected Vary variant.
+	discoveryKey, servedKey string
 }
 
 func newCacheRequest(r *http.Request) (*cacheRequest, error) {
@@ -1392,15 +1526,21 @@ type responseStreamer struct {
 	http.ResponseWriter
 	pipeReader *io.PipeReader
 	pipeWriter *io.PipeWriter
-	// deferHeaders keeps a state-changing response private until its cache
-	// invalidation has completed. Header must therefore return bufferedHeader
-	// rather than exposing the wrapped writer's live header map.
+	// deferHeaders postpones the client commit until invalidation or staging
+	// admission has completed. State-changing responses use bufferedHeader.
 	deferHeaders   bool
 	bufferedHeader http.Header
+	// Budgeted GET responses keep one live Header map across WriteHeader so
+	// saved references and later Header calls update the same trailer values.
+	retainHeader bool
 	// responseHeader is the immutable header snapshot that was committed with
 	// StatusCode. It is published by closing C, so WaitHeaders observes both,
 	// even when the actual client commit is deliberately deferred.
 	responseHeader http.Header
+	// clientHeader may change delivery framing or report staging refusal while
+	// responseHeader retains the origin metadata used for cache storage.
+	clientHeader   http.Header
+	stagingTrailer bool
 	// C is closed by WriteHeader to signal the headers' writing. headerOnce ensures it is closed at most once.
 	C          chan struct{}
 	commitC    chan struct{}
@@ -1410,10 +1550,10 @@ type responseStreamer struct {
 }
 
 // Header implements http.ResponseWriter. Ordinary responses retain the
-// wrapped writer's behavior. State-changing responses use a private copy so
-// neither their status nor headers become observable before invalidation.
+// wrapped writer's behavior. State-changing responses use a private copy until
+// invalidation permits the client commit.
 func (rw *responseStreamer) Header() http.Header {
-	if !rw.deferHeaders || rw.committed.Load() {
+	if !rw.deferHeaders || rw.retainHeader || rw.committed.Load() {
 		return rw.ResponseWriter.Header()
 	}
 	if rw.bufferedHeader == nil {
@@ -1451,16 +1591,27 @@ func (rw *responseStreamer) WriteHeader(status int) {
 }
 
 // CommitHeaders makes the first status and its header snapshot observable to
-// the client. For a state-changing request pipeUpstream calls this only after
-// successful-response invalidation is complete.
+// the client. Callers first complete successful-response invalidation or the
+// initial staging admission decision when headers are deferred.
 func (rw *responseStreamer) CommitHeaders() {
 	rw.commitOnce.Do(func() {
 		if rw.deferHeaders {
 			dst := rw.ResponseWriter.Header()
-			for name := range dst {
-				delete(dst, name)
+			header := rw.responseHeader
+			if rw.clientHeader != nil {
+				header = rw.clientHeader
 			}
-			for name, values := range rw.responseHeader {
+			for name := range dst {
+				if _, present := header[name]; !rw.retainHeader || !present {
+					delete(dst, name)
+				}
+			}
+			for name, values := range header {
+				// Header.Values exposes the original value slice. Retained
+				// trailer references must stay live across the deferred commit.
+				if current, present := dst[name]; rw.retainHeader && present && slices.Equal(current, values) {
+					continue
+				}
 				dst[name] = append([]string(nil), values...)
 			}
 		}
@@ -1473,6 +1624,45 @@ func (rw *responseStreamer) CommitHeaders() {
 			close(rw.commitC)
 		}
 	})
+}
+
+// commitStagingHeaders preserves the origin snapshot while making early
+// refusals visible and arranging a writable outcome for later refusals.
+func (rw *responseStreamer) commitStagingHeaders(req *http.Request, status string, admitted bool) {
+	if !rw.deferHeaders {
+		return
+	}
+	rw.clientHeader = rw.responseHeader.Clone()
+	if !admitted {
+		status = "SKIP"
+	}
+	rw.clientHeader.Set(CacheHeader, status)
+	rw.stagingTrailer = admitted && canConveyStaging(req, rw.StatusCode)
+	if rw.stagingTrailer {
+		rw.clientHeader.Add("Trailer", CacheStagingHeader)
+		if req.ProtoMajor == 1 {
+			// HTTP/1.1 trailers require chunked framing. Keep the origin length
+			// in responseHeader so storage and subsequent hits remain unchanged.
+			rw.clientHeader.Del("Content-Length")
+			if strings.EqualFold(rw.clientHeader.Get("Transfer-Encoding"), "identity") {
+				rw.clientHeader.Del("Transfer-Encoding")
+			}
+		}
+	}
+	rw.CommitHeaders()
+}
+
+// finishStaging is called only after the upstream has finished its writes and
+// trailer updates. The background Store must never write to ResponseWriter.
+func (rw *responseStreamer) finishStaging(status string) {
+	if rw.deferHeaders && !rw.retainHeader {
+		// An origin may retain the Header map it obtained before WriteHeader.
+		// Publish its trailers now that its goroutine no longer mutates that map.
+		copyValidationTrailers(rw.Header(), rw.bufferedHeader, rw.responseHeader)
+	}
+	if rw.stagingTrailer {
+		rw.Header().Set(CacheStagingHeader, status)
+	}
 }
 
 // Write implements http.ResponseWriter.

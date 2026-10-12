@@ -40,7 +40,11 @@ type Resource struct {
 	stale                     bool
 	// storedAt is when THIS cache wrote the entry, at full precision. Zero
 	// for a resource that did not come out of a cache.
-	storedAt time.Time
+	storedAt          time.Time
+	storedKey         string // exact entry generation retrieved, excluding a Vary discovery base
+	storageGeneration *cacheGeneration
+	storageRecord     *headerProvenance
+	handlerStoredAt   time.Time // opaque-cache evidence captured with this retrieval
 }
 
 func NewResource(statusCode int, body ReadSeekCloser, hdrs http.Header) *Resource {
@@ -238,15 +242,33 @@ func (r *Resource) MaxAge(shared bool) (time.Duration, error) {
 		return cc.Duration("max-age")
 	}
 
-	if expiresVal := r.header.Get("Expires"); expiresVal != "" {
+	if expiresVal, present := r.expiresValue(); present {
 		expires, err := http.ParseTime(expiresVal)
 		if err != nil {
-			return time.Duration(0), err
+			// RFC 9111 section 5.3 treats invalid Expires values as already
+			// expired. A validator can still make this stale response storable.
+			return 0, nil
 		}
-		return expires.Sub(Clock()), nil
+		date, dateErr := timeHeader("Date", r.header)
+		if dateErr != nil {
+			date, dateErr = timeHeader(ProxyDateHeader, r.header)
+			if dateErr != nil {
+				date = Clock()
+			}
+		}
+		return expires.Sub(date), nil
 	}
 
 	return time.Duration(0), nil
+}
+
+func (r *Resource) expiresValue() (string, bool) {
+	for name := range r.header {
+		if strings.EqualFold(name, "Expires") {
+			return combinedHeaderValues(r.header, "Expires"), true
+		}
+	}
+	return "", false
 }
 
 func (r *Resource) RemovePrivateHeaders() {
@@ -290,11 +312,8 @@ func (r *Resource) hasExplicitExpiration(shared bool) bool {
 		return true
 	}
 
-	if exp, _ := r.Expires(); !exp.IsZero() {
-		return true
-	}
-
-	return false
+	_, present := r.expiresValue()
+	return present
 }
 
 func (r *Resource) HeuristicFreshness() time.Duration {

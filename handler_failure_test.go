@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -32,26 +33,45 @@ func TestPassUpstreamInterruptedBodyIsNotStored(t *testing.T) {
 	}
 }
 
-func TestPassUpstreamMissingStagingFileIsNotStored(t *testing.T) {
+func TestPassUpstreamAnonymousStagingDoesNotRequireReopen(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("open anonymous files require POSIX unlink")
+	}
 	dir := t.TempDir()
 	t.Setenv("TMPDIR", dir)
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=3600")
 		_, _ = io.WriteString(w, "complete")
-		// Write returning means the pipe reader consumed the body. Remove the
-		// staging file before returning (and hence before the pipe reaches EOF)
-		// to exercise failure reopening it without relying on timing.
+		// The first pipe write has completed, so staging exists. Its name must
+		// already have been unlinked while the live descriptor remains readable.
 		files, err := filepath.Glob(filepath.Join(dir, "httpcache-*.tmp"))
-		if err != nil {
-			t.Error(err)
-		}
-		for _, file := range files {
-			if err := os.Remove(file); err != nil {
-				t.Error(err)
-			}
+		if err != nil || len(files) != 0 {
+			t.Errorf("named handler staging remains: %v %v", files, err)
 		}
 	})
-	assertFailedPassUpstream(t, dir, upstream, "complete")
+	c := NewMemoryCacheWithConfig(&CacheConfig{})
+	t.Cleanup(func() { _ = c.Close() })
+	h := NewHandler(c, upstream)
+	request := httptest.NewRequest(http.MethodGet, "http://example.org/anonymous", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, request)
+	h.writes.Wait()
+	if rec.Body.String() != "complete" || rec.Header().Get(CacheHeader) != "MISS" {
+		t.Fatalf("body=%q headers=%v", rec.Body.String(), rec.Header())
+	}
+	res, err := c.Retrieve(NewRequestKey(request).String())
+	if err != nil {
+		t.Fatalf("anonymous descriptor could not be cached: %v", err)
+	}
+	defer func() { _ = res.Close() }()
+	got, err := io.ReadAll(res)
+	if err != nil || string(got) != "complete" {
+		t.Fatalf("stored body=%q error=%v", got, err)
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 0 {
+		t.Fatalf("handler staging leftovers: %v %v", files, err)
+	}
 }
 
 func assertFailedPassUpstream(t *testing.T, dir string, upstream http.Handler, wantBody string) {
@@ -141,23 +161,23 @@ func TestLegacyStaleSnapshotReadsBaseLast(t *testing.T) {
 	}
 }
 
-func TestHandlerFreshGenerationPreservesNewerRecordAndPrunesExpired(t *testing.T) {
+func TestHandlerFreshGenerationRecordsLatestPublicationAndPrunesExpired(t *testing.T) {
 	c := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0))
 	t.Cleanup(func() { _ = c.Close() })
 	h := NewHandler(plainCache{inner: c}, nil)
 	now := Clock()
-	h.localFresh = map[string]time.Time{
-		"expired": now.Add(-2 * defaultStaleMarkerTTL),
-		"newer":   now.Add(time.Hour),
+	h.localFresh = map[string]*localFreshProof{
+		"expired": {at: now.Add(-2 * defaultStaleMarkerTTL)},
+		"newer":   {at: now.Add(time.Hour)},
 	}
-	h.recordFresh(time.Time{}, "new", "newer")
+	h.beginLocalPublication(time.Time{}, []string{"new", "newer"})(true)
 	if _, present := h.localFresh["expired"]; present {
 		t.Fatal("expired freshness record retained")
 	}
-	if !h.localFresh["newer"].Equal(now.Add(time.Hour)) || h.localFresh["new"].Before(now) {
+	if h.localFresh["newer"].at.Before(now) || h.localFresh["newer"].at.After(Clock()) || h.localFresh["new"].at.Before(now) {
 		t.Fatalf("freshness records=%v", h.localFresh)
 	}
-	h.localFresh["expired"] = now.Add(-2 * defaultStaleMarkerTTL)
+	h.localFresh["expired"] = &localFreshProof{at: now.Add(-2 * defaultStaleMarkerTTL)}
 	h.recordStale("new")
 	if _, present := h.localFresh["expired"]; present {
 		t.Fatal("invalidation retained an expired freshness record")
