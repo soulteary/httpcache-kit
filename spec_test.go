@@ -459,7 +459,7 @@ func TestSpecCacheControlMaxStale(t *testing.T) {
 func TestSpecValidatingStaleResponsesUnchanged(t *testing.T) {
 	client, upstream := testSetup()
 	upstream.CacheControl = "max-age=60"
-	upstream.Etag = "llamas1"
+	upstream.Etag = `"llamas1"`
 	status := client.get("/").cacheStatus
 	if strings.Compare("MISS", status) != 0 {
 		t.Fatalf("Cache status: %s not equal", status)

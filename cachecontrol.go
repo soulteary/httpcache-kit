@@ -16,7 +16,20 @@ const (
 type CacheControl map[string][]string
 
 func ParseCacheControlHeaders(h http.Header) (CacheControl, error) {
-	return ParseCacheControl(strings.Join(h["Cache-Control"], ", "))
+	// HTTP field names are case-insensitive, including headers constructed
+	// directly by an embedding application rather than net/http.
+	var names []string
+	for name := range h {
+		if strings.EqualFold(name, CacheControlHeader) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	var values []string
+	for _, name := range names {
+		values = append(values, h[name]...)
+	}
+	return ParseCacheControl(strings.Join(values, ", "))
 }
 
 func ParseCacheControl(input string) (CacheControl, error) {
@@ -61,7 +74,7 @@ func ParseCacheControl(input string) (CacheControl, error) {
 }
 
 func (cc CacheControl) Get(key string) (string, bool) {
-	v, exists := cc[key]
+	v, exists := cc[strings.ToLower(key)]
 	if exists && len(v) > 0 {
 		return v[0], true
 	}
@@ -69,6 +82,7 @@ func (cc CacheControl) Get(key string) (string, bool) {
 }
 
 func (cc CacheControl) Add(key, val string) {
+	key = strings.ToLower(key)
 	if !cc.Has(key) {
 		cc[key] = []string{}
 	}
@@ -78,7 +92,7 @@ func (cc CacheControl) Add(key, val string) {
 }
 
 func (cc CacheControl) Has(key string) bool {
-	_, exists := cc[key]
+	_, exists := cc[strings.ToLower(key)]
 	return exists
 }
 
