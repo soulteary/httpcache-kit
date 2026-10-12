@@ -46,7 +46,7 @@ func (k Key) Vary(varyHeader string, r *http.Request) Key {
 	k2 := k
 
 	for _, header := range parseVary(varyHeader) {
-		k2.vary = append(k2.vary, header+"="+r.Header.Get(header))
+		k2.vary = append(k2.vary, header+"="+combinedHeaderValues(r.Header, header))
 	}
 
 	return k2

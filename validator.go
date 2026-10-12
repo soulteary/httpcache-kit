@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 )
 
 type Validator struct {
@@ -15,28 +16,8 @@ func (v *Validator) Validate(req *http.Request, res *Resource) bool {
 	if req.Context().Err() != nil {
 		return false
 	}
-	outreq := cloneRequest(req)
-	resHeaders := canonicalValidationHeaders(res.Header())
-
-	switch {
-	case resHeaders.Get("Etag") != "":
-		outreq.Header.Set("If-None-Match", resHeaders.Get("Etag"))
-	case resHeaders.Get("Last-Modified") != "":
-		outreq.Header.Set("If-Modified-Since", resHeaders.Get("Last-Modified"))
-	default:
-		// Nothing to validate WITH.
-		//
-		// The request would otherwise go upstream unconditionally and come
-		// back with a full new body -- which this function ignores, comparing
-		// only headers. headersEqual returns true when the new response
-		// carries none of its four comparison headers, so the STORED body was
-		// served and freshened as "validated" even though the resource had
-		// changed underneath it. For an entry invalidated by a successful
-		// POST/PUT/PATCH/DELETE that is exactly the case that must not happen.
-		//
-		// Report that validation is not possible; the caller fetches the
-		// resource in full and replaces the entry.
-		debugf("no validator (ETag or Last-Modified) on the cached response; cannot revalidate")
+	outreq, ok := conditionalRequest(req, res)
+	if !ok {
 		return false
 	}
 
@@ -46,8 +27,27 @@ func (v *Validator) Validate(req *http.Request, res *Resource) bool {
 	// a potentially package-sized response in an httptest recorder.
 	resp := &validationResponse{header: make(http.Header)}
 	v.Handler.ServeHTTP(resp, outreq)
-	responseHeaders := canonicalValidationHeaders(resp.Header())
-	if req.Context().Err() != nil || resp.status != http.StatusNotModified || !headersEqual(resHeaders, responseHeaders) {
+	return applyValidationResponse(req, res, resp.status, resp.Header(), t)
+}
+
+func conditionalRequest(req *http.Request, res *Resource) (*http.Request, bool) {
+	outreq := cloneRequest(req)
+	headers := canonicalValidationHeaders(res.Header())
+	switch {
+	case headers.Get("Etag") != "":
+		outreq.Header.Set("If-None-Match", headers.Get("Etag"))
+	case headers.Get("Last-Modified") != "":
+		outreq.Header.Set("If-Modified-Since", headers.Get("Last-Modified"))
+	default:
+		return nil, false
+	}
+	return outreq, true
+}
+
+func applyValidationResponse(req *http.Request, res *Resource, status int, header http.Header, t time.Time) bool {
+	resHeaders := canonicalValidationHeaders(res.Header())
+	responseHeaders := canonicalValidationHeaders(header)
+	if req.Context().Err() != nil || status != http.StatusNotModified || !headersEqual(resHeaders, responseHeaders) {
 		return false
 	}
 

@@ -243,7 +243,14 @@ func (r *Resource) MaxAge(shared bool) (time.Duration, error) {
 		if err != nil {
 			return time.Duration(0), err
 		}
-		return expires.Sub(Clock()), nil
+		date, dateErr := timeHeader("Date", r.header)
+		if dateErr != nil {
+			date, dateErr = timeHeader(ProxyDateHeader, r.header)
+			if dateErr != nil {
+				date = Clock()
+			}
+		}
+		return expires.Sub(date), nil
 	}
 
 	return time.Duration(0), nil
@@ -290,7 +297,7 @@ func (r *Resource) hasExplicitExpiration(shared bool) bool {
 		return true
 	}
 
-	if exp, _ := r.Expires(); !exp.IsZero() {
+	if r.header.Get("Expires") != "" {
 		return true
 	}
 

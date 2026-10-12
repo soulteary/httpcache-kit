@@ -295,7 +295,12 @@ func (h *Handler) validateCachedResponse(rw http.ResponseWriter, cReq *cacheRequ
 	}
 
 	h.debugf("validating cached response")
-	if !h.validator.Validate(cReq.Request, res) {
+	valid, served := h.validateUpstreamResponse(rw, cReq, res)
+	if served {
+		_ = res.Close()
+		return false
+	}
+	if !valid {
 		h.debugf("response is changed")
 		h.refetchCachedResponse(rw, cReq, res)
 		return false
@@ -504,12 +509,16 @@ func (h *Handler) pipeUpstream(w http.ResponseWriter, r *cacheRequest) {
 // passUpstream makes the request via the upstream handler and stores the result
 // It uses streaming to avoid loading the entire response into memory for large files.
 func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest, complete func()) {
+	h.passUpstreamWithHandler(w, r, complete, h.upstream, Clock())
+}
+
+func (h *Handler) passUpstreamWithHandler(w http.ResponseWriter, r *cacheRequest, complete func(), upstream http.Handler, startedAt time.Time) {
 	rw, err := newResponseStreamer(w)
 	if err != nil {
 		defer callComplete(complete)
 		h.debugf("error creating response streamer: %v", err)
 		w.Header().Set(CacheHeader, "SKIP")
-		h.upstream.ServeHTTP(w, r.Request)
+		upstream.ServeHTTP(w, r.Request)
 		return
 	}
 	rdr, err := rw.NextReader()
@@ -517,16 +526,16 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest, complete 
 		defer callComplete(complete)
 		h.debugf("error creating next stream reader: %v", err)
 		w.Header().Set(CacheHeader, "SKIP")
-		h.upstream.ServeHTTP(w, r.Request)
+		upstream.ServeHTTP(w, r.Request)
 		return
 	}
 
-	t := Clock()
+	t := startedAt
 	h.debugf("passing request upstream")
 	rw.Header().Set(CacheHeader, "MISS")
 
 	go func() {
-		h.upstream.ServeHTTP(rw, r.Request)
+		upstream.ServeHTTP(rw, r.Request)
 		_ = rw.Close()
 	}()
 	rw.WaitHeaders()
@@ -724,7 +733,7 @@ func (h *Handler) allowsResponseStorage(res *Resource, r *cacheRequest, cc Cache
 	if cc.Has("no-cache") || cc.Has("no-store") {
 		return false
 	}
-	if varyWildcard(res.Header().Get("Vary")) {
+	if varyWildcard(combinedHeaderValues(res.Header(), "Vary")) {
 		return false
 	}
 
@@ -993,7 +1002,7 @@ func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func())
 		}
 
 		// store a secondary vary version
-		if vary := headers.Get("Vary"); vary != "" {
+		if vary := combinedHeaderValues(headers, "Vary"); vary != "" {
 			keys = append(keys, r.Key.Vary(vary, r.Request).String())
 		}
 
@@ -1060,7 +1069,7 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 	// check is harmless for them as well.
 	h.markInvalidatedResource(res, baseKey, baseKey, false)
 
-	if vary := res.Header().Get("Vary"); vary != "" {
+	if vary := combinedHeaderValues(res.Header(), "Vary"); vary != "" {
 		return h.lookupVaryResource(req, res, lookupKey, vary)
 	}
 	return res, nil
