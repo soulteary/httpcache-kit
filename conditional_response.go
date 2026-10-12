@@ -66,7 +66,11 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 		_ = exchange.reader.Close()
 		return false, false
 	}
-	if exchange.status == http.StatusPartialContent {
+	// An unstoreable successful response replaces the old representation too.
+	// Retaining its predecessor as a fresh HIT would serve obsolete content
+	// after responses such as 204 or a new 200 carrying no-store.
+	replacement := NewResourceBytes(exchange.status, nil, exchange.snapshot)
+	if exchange.status >= http.StatusOK && exchange.status < http.StatusMultipleChoices && !h.isCacheable(replacement, req) {
 		keys := req.validationKeys()
 		h.recordStale(keys...)
 		h.cache.Invalidate(keys...)

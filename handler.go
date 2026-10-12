@@ -398,10 +398,14 @@ func (h *Handler) refetchChangedVaryResponse(rw http.ResponseWriter, cReq *cache
 	fetch.Header.Del("If-Modified-Since")
 	client := newClientPreconditionWriter(rw, cReq.Request)
 	finished := make(chan struct{})
-	h.passUpstreamWithHandler(client, cReq, nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// The old keys were just invalidated. Record the rebuild after that
+	// barrier for third-party caches tracked through localFresh as well.
+	rebuilt := *cReq
+	rebuilt.Time = Clock()
+	h.passUpstreamWithHandler(client, &rebuilt, nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		defer close(finished)
 		h.upstream.ServeHTTP(w, fetch)
-	}), Clock())
+	}), rebuilt.Time)
 	// Main-path header updates must finish too: an empty uncacheable response
 	// can still be assigning X-Cache while the origin handler returns.
 	select {
@@ -611,18 +615,21 @@ func (h *Handler) passUpstreamWithHandler(w http.ResponseWriter, r *cacheRequest
 	rw.WaitHeaders()
 	h.debugf("upstream responded headers in %s", Clock().Sub(t).String())
 
-	// just the headers! Use a clone so storeResource can mutate (e.g. RemovePrivateHeaders) without racing with the client reading rw.Header().
-	res := NewResourceBytes(rw.StatusCode, nil, rw.Header().Clone())
+	// The committed snapshot is immutable. The live header map can already be
+	// receiving trailer updates, even when the response has no body.
+	res := NewResourceBytes(rw.StatusCode, nil, rw.responseHeader.Clone())
 	// Store the precise local start of this upstream fetch. The cache uses it
 	// to order an in-flight response against a concurrent invalidation without
 	// relying on second-granular HTTP dates.
 	res.RequestTime = t
 	if !h.isCacheable(res, r) {
 		h.debugf("resource is uncacheable")
-		rw.Header().Set(CacheHeader, "SKIP")
 		// Drain body so upstream goroutine can finish and client receives the response
 		_, _ = io.Copy(io.Discard, rdr)
 		_ = rdr.Close()
+		// The upstream has finished before the pipe closes, so changing the
+		// wrapped live headers here cannot race trailer publication.
+		rw.Header().Set(CacheHeader, "SKIP")
 		callComplete(complete)
 		return
 	}

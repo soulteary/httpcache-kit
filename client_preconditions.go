@@ -17,7 +17,8 @@ type clientPreconditionWriter struct {
 }
 
 func newClientPreconditionWriter(w http.ResponseWriter, req *http.Request) http.ResponseWriter {
-	if req.Header.Get("If-None-Match") == "" && req.Header.Get("If-Modified-Since") == "" {
+	if req.Header.Get("If-None-Match") == "" && req.Header.Get("If-Modified-Since") == "" &&
+		req.Header.Get("If-Match") == "" && req.Header.Get("If-Unmodified-Since") == "" {
 		return w
 	}
 	return &clientPreconditionWriter{ResponseWriter: w, req: req, header: w.Header().Clone()}
