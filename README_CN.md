@@ -563,3 +563,43 @@ go tool cover -func=coverage.out
 
 Apache License 2.0 —— 详见 [LICENSE](LICENSE)。部分代码源自
 [lox/httpcache](https://github.com/lox/httpcache)，采用 MIT 许可。
+
+
+## 校验、临时空间预算与跨实例填充
+
+新增配置均为可选项，默认保持原有行为。`CacheConfig.Integrity =
+IntegritySHA256` 为正文、长度、请求键、HTTP 状态和响应头，以及包含写入时间的私有
+元数据持久化 SHA256。命中前读取完整正文并验证；缺少私有摘要的旧缓存视为未命中，
+上游的 `Digest` 头不能替代它。损坏仅删除所观察到的键及版本，由 Handler 重新获取；
+`Freshen` 更新头部和时间时保留正文摘要。进程中断留下的正文、头部版本混合会被拒绝，
+私有元数据不会作为响应头发送。校验会增加一次完整正文读取；它检测意外损坏，不能
+防御能改写缓存并重新计算摘要的攻击者。默认模式读取已有的新格式缓存时仍验证摘要，
+新的写入使用原格式。
+
+把同一个 `StagingBudget` 注入 `CacheConfig` 和 `HandlerOptions`，可以同时统计
+Handler 响应副本与原生磁盘缓存正文、头部的临时副本。`NewLease(ctx, kind)` 为每个
+副本创建租约；`Reserve(bytes)` 必须非阻塞、线程安全且全部成功或全部拒绝，
+`Release(bytes)` 退还未使用的预留，`Close()` 幂等地释放全部持有量。
+`ErrStagingBudgetExceeded` 可用 `errors.Is` 判断。文件关闭后、发布或成功删除前
+仍占预算；删除失败保留计量。Handler 临时文件通过 `TempDir` 配置，在 Linux/macOS
+写入前解除文件名链接并保留描述符到后台 Store 完成，进程退出不会留下命名正文副本。
+Windows 使用命名文件，在关闭时删除。空间不足时继续排空上游流，客户端获得完整
+响应；磁盘缓存写入失败保留原有已提交条目。持久缓存仍受 `MaxSize` 约束，失效标记
+日志与自定义 VFS 缓冲不在此钩子内，自定义 VFS 需要自行计量。
+`StoreContext` 在流读写之间协作检查取消，不能打断任意阻塞 Reader 或 VFS 调用。
+
+`HandlerOptions.RequestKey` 是受信任的逻辑身份策略，返回 `Key`，不修改上游 URL。
+只合并已经独立确认内容身份一致的对象，并保留方法与 Vary 隔离，不应由不受信任请求头
+选择其他对象的键。非安全方法的失效操作也使用该策略，并保持 Location/
+Content-Location 的同源限制。策略错误返回 400。
+
+`MissCoordinator.Acquire(ctx, key)` 可由应用提供跨实例填充锁。获得锁后重新检查
+缓存，`MissLease` 保持到后台写入完成，或在跳过、错误时释放。等待须响应取消；获取
+失败返回 503，不另行发起重复上游填充。`Context()` 提供源自获取上下文的所有权或
+fencing 信息；`Close()` 必须有界、幂等。后台 `ContextStore` 通过
+`context.WithoutCancel` 接收这些上下文值，客户端完成不会取消缓存发布，后端仍须
+自行限制 I/O 时长并验证所有权。该接口本身不实现分布式锁、共享 LRU、跨进程原子发布
+或远端 lease fencing；共享磁盘仍需对读取、写入、freshen、失效等存储操作加锁。
+多实例共享目录时必须设置 `CacheConfig.DisableStagingSweep = true`，避免启动时
+删除其他实例正在写入的文件。此模式没有自动崩溃孤儿清理，需要全部实例停止后离线
+清理；会过期的远端租约还需要有 fencing 的发布机制。

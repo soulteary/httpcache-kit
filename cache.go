@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"container/list"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -173,6 +175,7 @@ type cache struct {
 
 var _ Cache = (*cache)(nil)
 var _ ExtendedCache = (*cache)(nil)
+var _ ContextStore = (*cache)(nil)
 
 type Header struct {
 	http.Header
@@ -294,7 +297,9 @@ func (c *cache) scanExistingCache() error {
 			// fallback; a new-format preamble supplies the exact timestamp.
 			entry.storedAt = headerInfo.ModTime()
 			entry.accessedAt = headerInfo.ModTime()
-			if _, persistedAt, readErr := c.readHeaderFile(headerPath, hashedKey); readErr == nil && !persistedAt.IsZero() {
+			// A scan has only the filename hash, not the original request key.
+			// Validate the private record while deferring its key binding to lookup.
+			if _, persistedAt, _, readErr := c.readHeaderRecordWithKeyCheck(headerPath, hashedKey, false); readErr == nil && !persistedAt.IsZero() {
 				entry.storedAt = persistedAt
 				entry.accessedAt = persistedAt
 			}
@@ -355,6 +360,7 @@ type stagedEntry struct {
 	tmpPath   string
 	target    string
 	published bool
+	lease     StagingLease
 }
 
 // stageWrite writes path's new contents, publishing them immediately only on
@@ -367,11 +373,18 @@ type stagedEntry struct {
 // write. readHeaderFile's terminator check still turns that window into a
 // miss on backends that keep it.
 func (c *cache) stageWrite(path string, r io.Reader) (*stagedEntry, int64, error) {
+	return c.stageWriteContext(context.Background(), path, r)
+}
+
+func (c *cache) stageWriteContext(ctx context.Context, path string, r io.Reader) (*stagedEntry, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
 	if err := c.mkdirAll(pathutil.Dir(path)); err != nil {
 		return nil, 0, fmt.Errorf("failed to create cache directory for %q: %w", path, err)
 	}
 	if c.diskRoot == "" {
-		n, published, err := c.vfsWrite(path, r)
+		n, published, err := c.vfsWrite(path, &contextReader{ctx: ctx, r: r})
 		return &stagedEntry{published: published}, n, err
 	}
 	if err := c.mkdirAll(stagingPrefix + formatPrefix); err != nil {
@@ -379,11 +392,26 @@ func (c *cache) stageWrite(path string, r io.Reader) (*stagedEntry, int64, error
 	}
 	stagingDir := filepath.Join(c.diskRoot, filepath.FromSlash(stagingPrefix+formatPrefix))
 	target := filepath.Join(c.diskRoot, filepath.FromSlash(path))
-	tmpPath, n, err := writeStagingFile(stagingDir, target, r)
-	if err != nil {
-		return nil, n, err
+	kind := StageCacheBody
+	if strings.HasPrefix(path, headerPrefix) {
+		kind = StageCacheHeader
 	}
-	return &stagedEntry{tmpPath: tmpPath, target: target}, n, nil
+	lease, err := newStageLease(ctx, c.config.StagingBudget, kind)
+	if err != nil {
+		return nil, 0, err
+	}
+	f, err := os.CreateTemp(stagingDir, filepath.Base(target)+".tmp-*")
+	if err != nil {
+		closeStageLease(lease)
+		return nil, 0, err
+	}
+	e := &stagedEntry{tmpPath: f.Name(), target: target, lease: lease}
+	n, copyErr := io.Copy(&stagingWriter{ctx: ctx, w: f, lease: lease}, r)
+	err = errors.Join(copyErr, f.Close())
+	if err != nil {
+		c.abandonStaged(e)
+	}
+	return e, n, err
 }
 
 func (c *cache) mkdirAll(path string) error {
@@ -432,6 +460,8 @@ func (c *cache) commitStaged(entries ...*stagedEntry) error {
 		}
 		e.tmpPath = ""
 		e.published = true
+		closeStageLease(e.lease)
+		e.lease = nil
 	}
 	return nil
 }
@@ -444,8 +474,11 @@ func (c *cache) abandonStaged(entries ...*stagedEntry) {
 		}
 		if err := os.Remove(e.tmpPath); err != nil && !os.IsNotExist(err) {
 			debugf("failed to remove staging file %s: %v", e.tmpPath, err)
+			continue
 		}
 		e.tmpPath = ""
+		closeStageLease(e.lease)
+		e.lease = nil
 	}
 }
 
@@ -464,7 +497,7 @@ func anyPublished(entries ...*stagedEntry) bool {
 // sit outside the scanned directories, so they never reach the LRU index, but
 // nothing else would reclaim their space either.
 func (c *cache) sweepStaging() {
-	if c.diskRoot == "" {
+	if c.diskRoot == "" || c.config.DisableStagingSweep {
 		return
 	}
 	dir := stagingPrefix + formatPrefix
@@ -512,33 +545,7 @@ func (c *cache) vfsWrite(path string, r io.Reader) (int64, bool, error) {
 //
 // The stale map takes this: losing invalidation state would republish
 // superseded content, so it is worth the fsync. Cache entries go through
-// writeStagingFile instead, which skips it.
-// writeStagingFile writes r into a fresh file under stagingDir and returns its
-// path. The caller renames it onto target to publish it, or removes it. The
-// name carries target's base so a leftover file is traceable.
-//
-// No fsync: rename is what makes a reader see either the old entry or the
-// whole new one, and that is all a cache entry needs. Durability across a
-// crash is not worth its price here -- an entry lost to a crash is a miss, and
-// the fsync costs several times the write itself.
-func writeStagingFile(stagingDir, target string, r io.Reader) (string, int64, error) {
-	f, err := os.CreateTemp(stagingDir, filepath.Base(target)+".tmp-*")
-	if err != nil {
-		return "", 0, fmt.Errorf("failed to create staging file for %q: %w", target, err)
-	}
-	tmpPath := f.Name()
-	n, copyErr := io.Copy(f, r)
-	closeErr := f.Close()
-	if copyErr != nil {
-		_ = os.Remove(tmpPath)
-		return "", n, fmt.Errorf("failed to write staging file for %q: %w", target, copyErr)
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmpPath)
-		return "", n, fmt.Errorf("failed to close staging file for %q: %w", target, closeErr)
-	}
-	return tmpPath, n, nil
-}
+// stageWriteContext instead, which skips it.
 
 func atomicWriteFile(path string, r io.Reader) (int64, error) {
 	dir := filepath.Dir(path)
@@ -575,9 +582,32 @@ func atomicWriteFile(path string, r io.Reader) (int64, error) {
 
 // Retrieve the Status and Headers for a given key path
 func (c *cache) Header(key string) (Header, error) {
-	path := headerPrefix + formatPrefix + hashKey(key)
-	h, _, err := c.readHeaderFile(path, key)
-	return h, err
+	h, err := c.header(key)
+	return h, c.integrityMiss(key, err)
+}
+
+func (c *cache) header(key string) (Header, error) {
+	c.cleanupMu.RLock()
+	defer c.cleanupMu.RUnlock()
+	c.publishMu.RLock()
+	defer c.publishMu.RUnlock()
+	hashed := hashKey(key)
+	h, _, meta, err := c.readHeaderRecord(headerPrefix+formatPrefix+hashed, key)
+	if err != nil || meta == nil {
+		return h, err
+	}
+	f, err := c.fs.Open(bodyPrefix + formatPrefix + hashed)
+	if err != nil {
+		if vfs.IsNotExist(err) {
+			return Header{}, &corruptEntryError{fingerprint: meta.fingerprint, reason: "body missing"}
+		}
+		return Header{}, err
+	}
+	defer func() { _ = f.Close() }()
+	if err := verifyStoredBody(f, meta, meta.fingerprint); err != nil {
+		return Header{}, err
+	}
+	return h, nil
 }
 
 // readHeaderFile reads a stored response header and its separate cache
@@ -589,13 +619,17 @@ func (c *cache) Header(key string) (Header, error) {
 // them leaves a single CRLF, not two.
 const headerRecordTerminator = "\r\n\r\n"
 
-func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
+func (c *cache) readHeaderRecord(path, key string) (Header, time.Time, *integrityRecord, error) {
+	return c.readHeaderRecordWithKeyCheck(path, key, true)
+}
+
+func (c *cache) readHeaderRecordWithKeyCheck(path, key string, checkKey bool) (Header, time.Time, *integrityRecord, error) {
 	f, err := c.fs.Open(path)
 	if err != nil {
 		if vfs.IsNotExist(err) {
-			return Header{}, time.Time{}, ErrNotFoundInCache
+			return Header{}, time.Time{}, nil, ErrNotFoundInCache
 		}
-		return Header{}, time.Time{}, fmt.Errorf("failed to open header file %q for key %q: %w", path, key, err)
+		return Header{}, time.Time{}, nil, fmt.Errorf("failed to open header file %q for key %q: %w", path, key, err)
 	}
 	defer func() { _ = f.Close() }()
 
@@ -605,7 +639,7 @@ func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 	// from corruption once the bytes are gone.
 	raw, err := io.ReadAll(f)
 	if err != nil {
-		return Header{}, time.Time{}, fmt.Errorf("failed to read header file %q for key %q: %w", path, key, err)
+		return Header{}, time.Time{}, nil, fmt.Errorf("failed to read header file %q for key %q: %w", path, key, err)
 	}
 
 	// The header file is this entry's commit marker. Store writes the body in
@@ -625,17 +659,29 @@ func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 	// resource whenever two requests for the same uncached URL overlapped,
 	// which is the ordinary case for a shared cache.
 	if !bytes.HasSuffix(raw, []byte(headerRecordTerminator)) {
-		return Header{}, time.Time{}, ErrNotFoundInCache
+		return Header{}, time.Time{}, nil, ErrNotFoundInCache
 	}
 
+	var meta *integrityRecord
+	if checkKey {
+		meta, err = decodeIntegrity(raw, key, c.config.Integrity != IntegrityDisabled)
+	} else {
+		meta, err = decodeIntegrityRecord(raw, key, c.config.Integrity != IntegrityDisabled, false)
+	}
+	if err != nil {
+		return Header{}, time.Time{}, nil, err
+	}
 	h, storedAt, err := readStoredHeaders(bufio.NewReader(bytes.NewReader(raw)))
 	if err != nil {
 		// The record is terminated, so this is a complete header that does not
 		// parse: corruption, not a write in flight.
-		return Header{}, time.Time{}, fmt.Errorf("failed to read headers from %q for key %q: %w", path, key, err)
+		if meta != nil {
+			return Header{}, time.Time{}, nil, &corruptEntryError{fingerprint: meta.fingerprint, reason: "invalid HTTP header record"}
+		}
+		return Header{}, time.Time{}, nil, fmt.Errorf("failed to read headers from %q for key %q: %w", path, key, err)
 	}
 
-	return h, storedAt, nil
+	return h, storedAt, meta, nil
 }
 
 // Store a resource against a number of keys. Resource bodies are streamed
@@ -643,6 +689,14 @@ func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 // Vary key), the seekable resource is rewound instead of being copied into an
 // unbounded in-memory buffer.
 func (c *cache) Store(res *Resource, keys ...string) error {
+	return c.StoreContext(context.Background(), res, keys...)
+}
+
+// StoreContext is Store with cooperative cancellation between streamed writes.
+func (c *cache) StoreContext(ctx context.Context, res *Resource, keys ...string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(keys) == 0 {
 		return nil
 	}
@@ -660,7 +714,7 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 
 	expectedSize, hasExpectedSize := expectedBodySize(res.Header())
 	for _, key := range keys {
-		if err := c.storeResourceForKey(res, key, expectedSize, hasExpectedSize); err != nil {
+		if err := c.storeResourceForKey(ctx, res, key, expectedSize, hasExpectedSize); err != nil {
 			return err
 		}
 	}
@@ -693,7 +747,7 @@ func expectedBodySize(h http.Header) (int64, bool) {
 
 // storeResourceForKey stages, admits, and publishes one entry. The caller
 // holds generationMu so invalidation cannot finalize between these steps.
-func (c *cache) storeResourceForKey(res *Resource, key string, expectedSize int64, hasExpectedSize bool) error {
+func (c *cache) storeResourceForKey(ctx context.Context, res *Resource, key string, expectedSize int64, hasExpectedSize bool) error {
 	hashedKey := hashKey(key)
 	unlock := c.lockKeyWriter(hashedKey)
 	defer unlock()
@@ -715,7 +769,7 @@ func (c *cache) storeResourceForKey(res *Resource, key string, expectedSize int6
 	// cleared the base marker that every OTHER variant is still judged
 	// against. The cleanup goroutine expires markers on its own.
 	storedAt := Clock()
-	headerData, err := serializeStoredHeader(res.Status(), res.Header(), storedAt)
+	headerData, err := c.serializeCacheHeader(res.Status(), res.Header(), storedAt, key, expectedSize, strings.Repeat("0", 64))
 	if err != nil {
 		return fmt.Errorf("failed to serialize headers for key %q: %w", key, err)
 	}
@@ -739,7 +793,11 @@ func (c *cache) storeResourceForKey(res *Resource, key string, expectedSize int6
 	// every failure here just drops the staged files. On a backend that
 	// writes in place there is nothing to stage, and the existing discard
 	// path still applies -- anyPublished says which case this is.
-	bodyStaged, written, err := c.stageBody(body, key)
+	digest := sha256.New()
+	if c.config.Integrity != IntegrityDisabled {
+		body = io.TeeReader(body, digest)
+	}
+	bodyStaged, written, err := c.stageBodyContext(ctx, body, key)
 	fail := func(err error) error {
 		return c.discardFailedStore(err, key, hashedKey, bodyStaged, written+int64(len(headerData)), storedAt)
 	}
@@ -749,13 +807,18 @@ func (c *cache) storeResourceForKey(res *Resource, key string, expectedSize int6
 	if hasExpectedSize && written != expectedSize {
 		return fail(fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize))
 	}
-	if !hasExpectedSize {
-		if err := c.reserveEntry(hashedKey, written+int64(len(headerData))); err != nil {
-			return fail(fmt.Errorf("failed to make room for key %q: %w", key, err))
-		}
+	headerData, err = c.serializeCacheHeader(res.Status(), res.Header(), storedAt, key, written, fmt.Sprintf("%x", digest.Sum(nil)))
+	if err != nil {
+		return fail(err)
+	}
+	if err := c.reserveEntry(hashedKey, written+int64(len(headerData))); err != nil {
+		return fail(fmt.Errorf("failed to make room for key %q: %w", key, err))
 	}
 
-	headerStaged, headerBytes, err := c.stageSerializedHeader(headerData, key)
+	headerStaged, headerBytes, err := c.stageSerializedHeaderContext(ctx, headerData, key)
+	if err == nil {
+		err = ctx.Err()
+	}
 	if err != nil {
 		c.abandonStaged(headerStaged)
 		return fail(err)
@@ -787,7 +850,11 @@ func (c *cache) discardFailedStore(err error, key, hashedKey string, body *stage
 }
 
 func (c *cache) stageBody(r io.Reader, key string) (*stagedEntry, int64, error) {
-	e, n, err := c.stageWrite(bodyPrefix+formatPrefix+hashKey(key), r)
+	return c.stageBodyContext(context.Background(), r, key)
+}
+
+func (c *cache) stageBodyContext(ctx context.Context, r io.Reader, key string) (*stagedEntry, int64, error) {
+	e, n, err := c.stageWriteContext(ctx, bodyPrefix+formatPrefix+hashKey(key), r)
 	if err != nil {
 		return e, n, fmt.Errorf("failed to store body for key %q: %w", key, err)
 	}
@@ -805,7 +872,11 @@ func serializeStoredHeader(code int, h http.Header, storedAt time.Time) ([]byte,
 }
 
 func (c *cache) stageSerializedHeader(headerData []byte, key string) (*stagedEntry, int64, error) {
-	e, n, err := c.stageWrite(headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(headerData))
+	return c.stageSerializedHeaderContext(context.Background(), headerData, key)
+}
+
+func (c *cache) stageSerializedHeaderContext(ctx context.Context, headerData []byte, key string) (*stagedEntry, int64, error) {
+	e, n, err := c.stageWriteContext(ctx, headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(headerData))
 	if err != nil {
 		return e, n, fmt.Errorf("failed to store header for key %q: %w", key, err)
 	}
@@ -814,6 +885,11 @@ func (c *cache) stageSerializedHeader(headerData []byte, key string) (*stagedEnt
 
 // Retrieve returns a cached Resource for the given key
 func (c *cache) Retrieve(key string) (*Resource, error) {
+	res, err := c.retrieve(key)
+	return res, c.integrityMiss(key, err)
+}
+
+func (c *cache) retrieve(key string) (*Resource, error) {
 	// Cleanup removes an expired entry and its invalidation marker as one
 	// generation transition. Holding the read side from file open through the
 	// marker check means a retrieval either observes the old file WITH its
@@ -839,7 +915,7 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 		}
 		return nil, fmt.Errorf("failed to open body file %q for key %q: %w", bodyPath, key, err)
 	}
-	h, persistedAt, err := c.readHeaderFile(headerPrefix+formatPrefix+hashedKey, key)
+	h, persistedAt, meta, err := c.readHeaderRecord(headerPrefix+formatPrefix+hashedKey, key)
 	if err != nil {
 		_ = f.Close()
 		if err == ErrNotFoundInCache {
@@ -847,6 +923,12 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 			return nil, ErrNotFoundInCache
 		}
 		return nil, fmt.Errorf("failed to retrieve header for key %q: %w", key, err)
+	}
+	if meta != nil {
+		if err := verifyStoredBody(f, meta, meta.fingerprint); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 	}
 	res := NewResource(h.StatusCode, f, h.Header)
 	if persistedAt.IsZero() {
@@ -1123,9 +1205,6 @@ func (c *cache) Freshen(res *Resource, keys ...string) error {
 		}
 
 		for _, key := range keys {
-			// A Vary base describes how to find variants; its body can belong to
-			// another request. Freshen only the retrieved generation, while the
-			// invalidation checks above still include every governing key.
 			if res.storedKey != "" && key != res.storedKey {
 				continue
 			}
@@ -1160,7 +1239,7 @@ func (c *cache) freshenResourceForKey(res *Resource, key string) (bool, error) {
 	defer unlock()
 	c.beginReservation(hashedKey)
 	defer c.releaseReservation(hashedKey)
-	h, storedAt, err := c.readHeaderFile(headerPrefix+formatPrefix+hashedKey, key)
+	h, storedAt, meta, err := c.readHeaderRecord(headerPrefix+formatPrefix+hashedKey, key)
 	if err != nil {
 		// A newly fetched HEAD has nothing to freshen if no GET is stored.
 		if errors.Is(err, ErrNotFoundInCache) && res.storedAt.IsZero() {
@@ -1187,6 +1266,10 @@ func (c *cache) freshenResourceForKey(res *Resource, key string) (bool, error) {
 	}
 	freshenedAt := Clock()
 	headerData, err := serializeStoredHeader(h.StatusCode, res.Header(), freshenedAt)
+	if meta != nil {
+		meta.StoredAt = freshenedAt
+		headerData, err = serializeIntegrityHeader(h.StatusCode, res.Header(), *meta)
+	}
 	if err != nil {
 		return false, fmt.Errorf("failed to serialize freshening target %q: %w", key, err)
 	}
@@ -1243,6 +1326,18 @@ func readStoredHeaders(r *bufio.Reader) (Header, time.Time, error) {
 		if err != nil {
 			return Header{}, time.Time{}, fmt.Errorf("malformed cache timestamp: %w", err)
 		}
+		line, err = tp.ReadLine()
+		if err != nil {
+			return Header{}, time.Time{}, err
+		}
+	}
+
+	if strings.HasPrefix(line, integrityPreamble) {
+		meta, parseErr := parseIntegrityPreamble(line)
+		if parseErr != nil {
+			return Header{}, time.Time{}, parseErr
+		}
+		storedAt = meta.StoredAt
 		line, err = tp.ReadLine()
 		if err != nil {
 			return Header{}, time.Time{}, err

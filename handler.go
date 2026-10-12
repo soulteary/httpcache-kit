@@ -52,6 +52,17 @@ var cacheableByDefault = map[int]bool{
 // if nil, the package-level logger (see SetLogger) is used.
 type HandlerOptions struct {
 	Logger *logger.Logger
+	// StagingBudget accounts for the response copy retained through Store.
+	StagingBudget StagingBudget
+	// TempDir selects the handler staging directory; empty uses os.TempDir.
+	TempDir string
+	// RequestKey is a trusted application policy for logical identities. It
+	// must preserve method and Vary separation and may only merge URLs whose
+	// content identity the application has independently verified. It never
+	// changes the upstream request URL. Errors reject the request with 400.
+	RequestKey func(*http.Request) (Key, error)
+	// MissCoordinator optionally serializes fills across handler instances.
+	MissCoordinator MissCoordinator
 
 	// StaleMarkerTTL is how long the handler remembers an invalidation for a
 	// Cache that does not implement StaleAt itself.
@@ -75,12 +86,16 @@ type Handler struct {
 	// Authorization header are storable. Deploying a shared cache without
 	// setting this serves one user's response to another. Prefer
 	// NewSharedHandler, which cannot be forgotten.
-	Shared    bool
-	upstream  http.Handler
-	validator *Validator
-	cache     Cache
-	metrics   Metrics
-	log       *logger.Logger
+	Shared          bool
+	upstream        http.Handler
+	validator       *Validator
+	cache           Cache
+	metrics         Metrics
+	log             *logger.Logger
+	stagingBudget   StagingBudget
+	tempDir         string
+	requestKey      func(*http.Request) (Key, error)
+	missCoordinator MissCoordinator
 
 	lifecycleMu sync.Mutex
 	writes      sync.WaitGroup
@@ -145,6 +160,10 @@ func NewHandlerWithOptions(cache Cache, upstream http.Handler, opts *HandlerOpti
 	if opts != nil && opts.StaleMarkerTTL > 0 {
 		h.localStaleTTL = opts.StaleMarkerTTL
 	}
+	if opts != nil {
+		h.stagingBudget, h.tempDir = opts.StagingBudget, opts.TempDir
+		h.requestKey, h.missCoordinator = opts.RequestKey, opts.MissCoordinator
+	}
 	return h
 }
 
@@ -196,6 +215,13 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			http.StatusBadRequest)
 		return
 	}
+	if h.requestKey != nil {
+		cReq.Key, err = h.requestKey(r)
+		if err != nil {
+			http.Error(rw, "invalid cache identity", http.StatusBadRequest)
+			return
+		}
+	}
 
 	if !cReq.isCacheable() {
 		h.debugf("request not cacheable")
@@ -245,8 +271,7 @@ func (h *Handler) resolveMiss(rw http.ResponseWriter, cReq *cacheRequest) (*Reso
 	}
 	flight, leader := h.claimMiss(cReq.Key.String())
 	if leader {
-		h.passUpstream(rw, cReq, func() { h.finishMiss(cReq.Key.String(), flight) })
-		return nil, false
+		return h.leadMiss(rw, cReq, func() { h.finishMiss(cReq.Key.String(), flight) })
 	}
 
 	select {
@@ -255,6 +280,9 @@ func (h *Handler) resolveMiss(rw http.ResponseWriter, cReq *cacheRequest) (*Reso
 		if err != nil {
 			// The leader could not cache the response. Fall through to an
 			// uncoupled upstream request so followers are never stranded.
+			if h.missCoordinator != nil {
+				return h.resolveMiss(rw, cReq)
+			}
 			h.passUpstream(rw, cReq, nil)
 			return nil, false
 		}
@@ -569,64 +597,31 @@ func (h *Handler) passUpstreamWithHandler(w http.ResponseWriter, r *cacheRequest
 		return
 	}
 
-	// Create temporary file to store body for caching (supports multiple reads for multiple keys)
-	tmpFile, err := os.CreateTemp("", "httpcache-*.tmp")
+	stage, err := newHandlerStage(r.Context(), h.tempDir, h.stagingBudget)
+	if err == nil {
+		_, err = io.Copy(&stagingWriter{ctx: r.Context(), w: stage.File, lease: stage.lease}, rdr)
+	}
 	if err != nil {
-		h.debugf("error creating temp file: %v, skipping cache", err)
-		// Keep draining the stream so the client receives the complete response,
-		// but never fall back to an unbounded in-memory copy.
-		_, err := io.Copy(io.Discard, rdr)
-		_ = rdr.Close()
-		if err != nil {
-			h.debugf("error reading stream: %v", err)
+		h.debugf("temporary response storage unavailable: %v, skipping cache", err)
+		if stage != nil {
+			_ = stage.Close()
 		}
-		rw.Header().Set(CacheHeader, "SKIP")
-		callComplete(complete)
-		return
-	}
-	tmpPath := tmpFile.Name()
-
-	// Since responseStreamer.Write already writes to both pipeWriter (for pipeReader) and ResponseWriter (client),
-	// the client is already receiving data. We read from pipeReader and write to temp file for caching.
-	// This allows us to cache without blocking the client response.
-	_, err = io.Copy(tmpFile, rdr)
-	if err != nil {
-		h.debugf("error copying to temp file: %v", err)
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpPath)
-		_ = rdr.Close()
-		rw.Header().Set(CacheHeader, "SKIP")
-		callComplete(complete)
-		return
-	}
-
-	// Close temp file for writing
-	if err := tmpFile.Close(); err != nil {
-		h.debugf("error closing temp file: %v", err)
-		_ = os.Remove(tmpPath)
+		// Reserve never waits: drain the pipe to finish delivering the complete
+		// origin response even when overlapping copies exhaust the budget.
+		_, _ = io.Copy(io.Discard, rdr)
 		_ = rdr.Close()
 		rw.Header().Set(CacheHeader, "SKIP")
 		callComplete(complete)
 		return
 	}
 	_ = rdr.Close()
-
-	upstreamDuration := Clock().Sub(t)
-	h.debugf("full upstream response took %s", upstreamDuration.String())
-
-	// Create Resource from temp file for caching
-	tmpFileReader, err := os.Open(tmpPath)
-	if err != nil {
-		h.debugf("error reopening temp file for caching: %v", err)
-		_ = os.Remove(tmpPath)
-		rw.Header().Set(CacheHeader, "SKIP")
+	if _, err := stage.Seek(0, io.SeekStart); err != nil {
+		_ = stage.Close()
 		callComplete(complete)
 		return
 	}
-
-	// Create a ReadSeekCloser from temp file
-	// The temp file will be cleaned up after caching is complete
-	res.ReadSeekCloser = &tempFileReadSeekCloser{file: tmpFileReader, path: tmpPath}
+	upstreamDuration := Clock().Sub(t)
+	res.ReadSeekCloser = stage
 
 	// Record upstream duration metric
 	if h.metrics != nil {
@@ -820,7 +815,7 @@ func (h *Handler) serveResource(res *Resource, w http.ResponseWriter, req *cache
 // been POSTed to, PUT or DELETEd kept being served from cache until its own
 // freshness lifetime ran out.
 func (h *Handler) invalidateResource(res *Resource, r *cacheRequest) {
-	keys := invalidationKeys(res, r)
+	keys := h.invalidationKeys(res, r)
 	if len(keys) == 0 {
 		return
 	}
@@ -1019,7 +1014,13 @@ func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func())
 			keys = append(keys, r.Key.Vary(vary, r.Request).String())
 		}
 
-		if err := h.cache.Store(res, keys...); err != nil {
+		var err error
+		if contextual, ok := h.cache.(ContextStore); ok {
+			err = contextual.StoreContext(context.WithoutCancel(r.Context()), res, keys...)
+		} else {
+			err = h.cache.Store(res, keys...)
+		}
+		if err != nil {
 			h.errorf("storing resources %#v failed with error: %s", keys, err.Error())
 			if h.metrics != nil {
 				h.metricsRef().RecordStoreOperation(false)
