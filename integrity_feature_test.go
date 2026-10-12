@@ -170,34 +170,7 @@ func TestIntegritySHA256RejectsTamperingAndPreservesNeighbor(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				prefix := bodyPrefix
-				if strings.Contains(kind, "header") || strings.Contains(kind, "status") {
-					prefix = headerPrefix
-				}
-				path := integrityFeaturePath(dir, prefix, key)
-				raw, err := os.ReadFile(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				originalSize := len(raw)
-				switch kind {
-				case "same-length-body":
-					raw[0] ^= 1
-				case "truncated-body":
-					raw = raw[:len(raw)-1]
-				case "appended-body":
-					raw = append(raw, '!')
-				case "same-length-header":
-					raw = bytes.Replace(raw, []byte("trusted-origin"), []byte("hostile-origin"), 1)
-				case "same-length-status":
-					raw = bytes.Replace(raw, []byte("HTTP/1.1 200 OK"), []byte("HTTP/1.1 404 OK"), 1)
-				}
-				if strings.HasPrefix(kind, "same-length") && len(raw) != originalSize {
-					t.Fatal("tamper fixture changed length")
-				}
-				if err := os.WriteFile(path, raw, 0600); err != nil {
-					t.Fatal(err)
-				}
+				integrityFeatureTamperFile(t, dir, key, kind)
 				if restart {
 					c = integrityFeatureCache(t, dir, IntegritySHA256)
 				}
@@ -217,6 +190,38 @@ func TestIntegritySHA256RejectsTamperingAndPreservesNeighbor(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func integrityFeatureTamperFile(t *testing.T, dir, key, kind string) {
+	t.Helper()
+	prefix := bodyPrefix
+	if strings.Contains(kind, "header") || strings.Contains(kind, "status") {
+		prefix = headerPrefix
+	}
+	path := integrityFeaturePath(dir, prefix, key)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalSize := len(raw)
+	switch kind {
+	case "same-length-body":
+		raw[0] ^= 1
+	case "truncated-body":
+		raw = raw[:len(raw)-1]
+	case "appended-body":
+		raw = append(raw, '!')
+	case "same-length-header":
+		raw = bytes.Replace(raw, []byte("trusted-origin"), []byte("hostile-origin"), 1)
+	case "same-length-status":
+		raw = bytes.Replace(raw, []byte("HTTP/1.1 200 OK"), []byte("HTTP/1.1 404 OK"), 1)
+	}
+	if strings.HasPrefix(kind, "same-length") && len(raw) != originalSize {
+		t.Fatal("tamper fixture changed length")
+	}
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -344,33 +349,7 @@ func TestIntegritySHA256RejectsMixedGenerationsAndMetadataTampering(t *testing.T
 					t.Fatal(err)
 				}
 			} else {
-				preamble, httpRecord, ok := bytes.Cut(raw, []byte("\r\n"))
-				if !ok {
-					t.Fatal("missing metadata line")
-				}
-				encoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(string(preamble), integrityPreamble))
-				if err != nil {
-					t.Fatal(err)
-				}
-				var record map[string]any
-				if err := json.Unmarshal(encoded, &record); err != nil {
-					t.Fatal(err)
-				}
-				switch kind {
-				case "timestamp":
-					record["stored_at"] = Clock().Add(24 * time.Hour).Format(time.RFC3339Nano)
-				case "size":
-					record["size"] = float64(3)
-				case "body-digest":
-					record["body_sha256"] = integrityFeatureDigest([]byte("BBBB"))
-				case "key-binding":
-					record["key_sha256"] = integrityFeatureDigest([]byte("another-key"))
-				}
-				encoded, err = json.Marshal(record)
-				if err != nil {
-					t.Fatal(err)
-				}
-				raw = append([]byte(integrityPreamble+base64.RawURLEncoding.EncodeToString(encoded)+"\r\n"), httpRecord...)
+				raw = integrityFeatureTamperMetadata(t, raw, kind)
 			}
 			if err := os.WriteFile(path, raw, 0600); err != nil {
 				t.Fatal(err)
@@ -382,6 +361,37 @@ func TestIntegritySHA256RejectsMixedGenerationsAndMetadataTampering(t *testing.T
 			integrityFeatureMiss(t, restarted, key)
 		})
 	}
+}
+
+func integrityFeatureTamperMetadata(t *testing.T, raw []byte, kind string) []byte {
+	t.Helper()
+	preamble, httpRecord, ok := bytes.Cut(raw, []byte("\r\n"))
+	if !ok {
+		t.Fatal("missing metadata line")
+	}
+	encoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(string(preamble), integrityPreamble))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record map[string]any
+	if err := json.Unmarshal(encoded, &record); err != nil {
+		t.Fatal(err)
+	}
+	switch kind {
+	case "timestamp":
+		record["stored_at"] = Clock().Add(24 * time.Hour).Format(time.RFC3339Nano)
+	case "size":
+		record["size"] = float64(3)
+	case "body-digest":
+		record["body_sha256"] = integrityFeatureDigest([]byte("BBBB"))
+	case "key-binding":
+		record["key_sha256"] = integrityFeatureDigest([]byte("another-key"))
+	}
+	encoded, err = json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append([]byte(integrityPreamble+base64.RawURLEncoding.EncodeToString(encoded)+"\r\n"), httpRecord...)
 }
 
 func TestIntegritySHA256CorruptEntryRefetchesThroughHandler(t *testing.T) {

@@ -123,33 +123,38 @@ func TestStagingBudgetSharedOverlappingCopies(t *testing.T) {
 				}
 				t.Fatalf("failed admission published an entry: %v", err)
 			}
-			budget.assertReleased(t)
-			entries, err := os.ReadDir(tmp)
-			if err != nil || len(entries) != 0 {
-				t.Fatalf("handler orphan files: %v %v", entries, err)
-			}
-			entries, err = os.ReadDir(filepath.Join(dir, stagingPrefix, formatPrefix))
-			if err != nil && !os.IsNotExist(err) {
-				t.Fatal(err)
-			}
-			if len(entries) != 0 {
-				t.Fatalf("native orphan stages: %v", entries)
-			}
-			if tc.cached {
-				budget.mu.Lock()
-				got := append([]StageKind(nil), budget.kinds...)
-				budget.mu.Unlock()
-				want := []StageKind{StageHandlerBody, StageCacheBody, StageCacheHeader}
-				if len(got) != len(want) {
-					t.Fatalf("stage kinds %v", got)
-				}
-				for i := range want {
-					if got[i] != want[i] {
-						t.Fatalf("stage kinds %v", got)
-					}
-				}
-			}
+			assertFeatureStagingReleased(t, budget, dir, tmp, tc.cached)
 		})
+	}
+}
+
+func assertFeatureStagingReleased(t *testing.T, budget *featureBudget, dir, tmp string, cached bool) {
+	t.Helper()
+	budget.assertReleased(t)
+	entries, err := os.ReadDir(tmp)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("handler orphan files: %v %v", entries, err)
+	}
+	entries, err = os.ReadDir(filepath.Join(dir, stagingPrefix, formatPrefix))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("native orphan stages: %v", entries)
+	}
+	if cached {
+		budget.mu.Lock()
+		got := append([]StageKind(nil), budget.kinds...)
+		budget.mu.Unlock()
+		want := []StageKind{StageHandlerBody, StageCacheBody, StageCacheHeader}
+		if len(got) != len(want) {
+			t.Fatalf("stage kinds %v", got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("stage kinds %v", got)
+			}
+		}
 	}
 }
 

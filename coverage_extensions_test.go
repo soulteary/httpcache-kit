@@ -196,7 +196,7 @@ func TestFreshenLegacyHeadersPersistsGeneration(t *testing.T) {
 	if err := c.Freshen(res, key); err != nil {
 		t.Fatalf("freshen old header format: %v", err)
 	}
-	h, persisted, err := c.readHeaderFile(headerPrefix+formatPrefix+hashKey(key), key)
+	h, persisted, _, err := c.readHeaderRecord(headerPrefix+formatPrefix+hashKey(key), key)
 	if err != nil || persisted.IsZero() || persisted.Before(previous) || h.Get("X-Validated") != "yes" {
 		t.Fatalf("legacy generation was not upgraded: header=%v storedAt=%v error=%v", h, persisted, err)
 	}
@@ -250,8 +250,8 @@ func TestSizeCleanupSkipsReservedEntry(t *testing.T) {
 
 func TestTemporaryCacheWritesRejectMissingParent(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "missing")
-	if path, n, err := writeStagingFile(dir, filepath.Join(dir, "body"), strings.NewReader("replacement")); path != "" || n != 0 || !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("missing staging parent: path=%q bytes=%d error=%v", path, n, err)
+	if stage, err := newHandlerStage(context.Background(), dir, nil); stage != nil || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing staging parent: stage=%v error=%v", stage, err)
 	}
 	if n, err := atomicWriteFile(filepath.Join(dir, "markers.json"), strings.NewReader("{}")); n != 0 || !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("missing snapshot parent: bytes=%d error=%v", n, err)
