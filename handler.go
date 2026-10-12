@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -295,6 +296,7 @@ func (h *Handler) validateCachedResponse(rw http.ResponseWriter, cReq *cacheRequ
 	}
 
 	h.debugf("validating cached response")
+	previousVary := combinedHeaderValues(res.Header(), "Vary")
 	valid, served := h.validateUpstreamResponse(rw, cReq, res)
 	if served {
 		_ = res.Close()
@@ -307,9 +309,12 @@ func (h *Handler) validateCachedResponse(rw http.ResponseWriter, cReq *cacheRequ
 	}
 	h.debugf("response is valid")
 	keys := cReq.validationKeys()
-	if !h.isCacheable(res, cReq) {
+	if !h.isCacheable(res, cReq) || !sameVaryFields(previousVary, combinedHeaderValues(res.Header(), "Vary")) {
 		// A 304 can withdraw permission to reuse the stored response. Do not
 		// freshen a formerly public object or leave the old policy available.
+		// A changed Vary field set also needs a full Store to rebuild both the
+		// base discovery entry and the variant key. Keep old keys stale even
+		// if that refetch fails, rather than refreshing the old selection rule.
 		h.recordStale(keys...)
 		h.cache.Invalidate(keys...)
 		h.refetchCachedResponse(rw, cReq, res)
@@ -325,6 +330,13 @@ func (h *Handler) validateCachedResponse(rw http.ResponseWriter, cReq *cacheRequ
 		return false
 	}
 	return true
+}
+
+func sameVaryFields(first, second string) bool {
+	firstFields, secondFields := parseVary(first), parseVary(second)
+	slices.Sort(firstFields)
+	slices.Sort(secondFields)
+	return slices.Equal(slices.Compact(firstFields), slices.Compact(secondFields))
 }
 
 func (cReq *cacheRequest) validationKeys() []string {
@@ -793,6 +805,7 @@ func (h *Handler) serveResource(res *Resource, w http.ResponseWriter, req *cache
 
 	// hacky handler for non-ok statuses
 	if res.Status() != http.StatusOK {
+		w = newClientPreconditionWriter(w, req.Request)
 		w.WriteHeader(res.Status())
 		_, _ = io.Copy(w, res)
 	} else {

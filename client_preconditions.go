@@ -24,7 +24,10 @@ func newClientPreconditionWriter(w http.ResponseWriter, req *http.Request) http.
 func (w *clientPreconditionWriter) Header() http.Header { return w.header }
 func (w *clientPreconditionWriter) WriteHeader(status int) {
 	header := w.header
-	if status == http.StatusOK || status == http.StatusPartialContent {
+	// Successful representations, including transformed 203 responses, can
+	// satisfy the original conditions. Redirects and errors take precedence
+	// (RFC 9110 section 13.2.1), even when they carry matching validators.
+	if status == http.StatusOK || status == http.StatusNonAuthoritativeInfo || status == http.StatusPartialContent {
 		probe := &preconditionProbe{header: header.Clone()}
 		req := w.req.Clone(w.req.Context())
 		req.Header.Del("Range") // The upstream has already applied the range.
