@@ -269,28 +269,34 @@ func (h *Handler) resolveMiss(rw http.ResponseWriter, cReq *cacheRequest) (*Reso
 	if h.metrics != nil {
 		h.metricsRef().RecordCacheMiss(cReq.Method)
 	}
-	flight, leader := h.claimMiss(cReq.Key.String())
-	if leader {
-		return h.leadMiss(rw, cReq, func() { h.finishMiss(cReq.Key.String(), flight) })
-	}
+	for {
+		if cReq.Context().Err() != nil {
+			return nil, false
+		}
+		flight, leader := h.claimMiss(cReq.Key.String())
+		if leader {
+			return h.leadMiss(rw, cReq, func() { h.finishMiss(cReq.Key.String(), flight) })
+		}
 
-	select {
-	case <-flight.done:
-		res, err := h.lookup(cReq)
-		if err != nil {
-			// The leader could not cache the response. Fall through to an
-			// uncoupled upstream request so followers are never stranded.
+		select {
+		case <-flight.done:
+			res, err := h.lookup(cReq)
+			if err == nil {
+				// An invalidation can race the leader's completed Store. Return
+				// through the ordinary hit checks rather than bypass validation.
+				return res, true
+			}
 			if h.missCoordinator != nil {
-				return h.resolveMiss(rw, cReq)
+				// The leader could not store this response. Compete for a new
+				// coordinated fill without growing the stack or recording this
+				// client's original miss again after every other failed fill.
+				continue
 			}
 			h.passUpstream(rw, cReq, nil)
 			return nil, false
+		case <-cReq.Context().Done():
+			return nil, false
 		}
-		// Invalidation may race the leader's completed Store and mark this
-		// response stale before the follower wakes. Do not bypass validation.
-		return res, true
-	case <-cReq.Context().Done():
-		return nil, false
 	}
 }
 
@@ -373,11 +379,15 @@ func sameVaryFields(first, second string) bool {
 }
 
 func (cReq *cacheRequest) validationKeys() []string {
-	// Freshen both the base key and the variant that lookup actually retrieved.
+	// Include the actual discovery key: HEAD can retrieve GET and then select
+	// its Vary variant, so the request key alone does not fence other variants.
 	// Otherwise the variant's older Proxy-Date makes it stale again on every
 	// subsequent request until the base invalidation marker is swept.
 	keys := []string{cReq.Key.String()}
-	if cReq.servedKey != "" && cReq.servedKey != keys[0] {
+	if cReq.discoveryKey != "" && cReq.discoveryKey != keys[0] {
+		keys = append(keys, cReq.discoveryKey)
+	}
+	if cReq.servedKey != "" && !slices.Contains(keys, cReq.servedKey) {
 		keys = append(keys, cReq.servedKey)
 	}
 	return keys
@@ -401,6 +411,7 @@ func (h *Handler) refetchChangedVaryResponse(rw http.ResponseWriter, cReq *cache
 	// The old keys were just invalidated. Record the rebuild after that
 	// barrier for third-party caches tracked through localFresh as well.
 	rebuilt := *cReq
+	rebuilt.Request = fetch // Storage variants must describe the headers sent upstream.
 	rebuilt.Time = Clock()
 	h.passUpstreamWithHandler(client, &rebuilt, nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		defer close(finished)
@@ -1107,11 +1118,14 @@ type staleSnapshotChecker interface {
 // lookupResource finds the best matching Resource for the
 // request, or nil and ErrNotFoundInCache if none is found
 func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
+	// A miss retry can select a different base or Vary policy.
+	req.discoveryKey, req.servedKey = "", ""
 	res, lookupKey, err := h.lookupBaseResource(req)
 	if err != nil {
 		return res, err
 	}
 	baseKey := lookupKey.String()
+	req.discoveryKey = baseKey
 
 	// A third-party Cache can complete a pre-mutation background Store after
 	// its own Invalidate call. The handler's generation record is what prevents
@@ -1198,9 +1212,9 @@ type cacheRequest struct {
 	Time         time.Time
 	CacheControl CacheControl
 
-	// servedKey is the key lookup actually retrieved, which differs from Key
-	// when a Vary variant was selected.
-	servedKey string
+	// discoveryKey records the actual base used by lookup, including the GET
+	// fallback for HEAD; servedKey records its selected Vary variant.
+	discoveryKey, servedKey string
 }
 
 func newCacheRequest(r *http.Request) (*cacheRequest, error) {

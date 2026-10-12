@@ -17,6 +17,7 @@ import (
 	"os"
 	pathutil "path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -451,6 +452,12 @@ func (c *cache) lockKeyWriter(hashedKey string) func() {
 func (c *cache) commitStaged(entries ...*stagedEntry) error {
 	c.publishMu.Lock()
 	defer c.publishMu.Unlock()
+	return c.commitStagedLocked(entries...)
+}
+
+// commitStagedLocked requires publishMu, allowing a failed multi-key commit
+// to discard its partial publication before any reader observes it.
+func (c *cache) commitStagedLocked(entries ...*stagedEntry) error {
 	for _, e := range entries {
 		if e == nil || e.tmpPath == "" {
 			continue
@@ -708,17 +715,136 @@ func (c *cache) StoreContext(ctx context.Context, res *Resource, keys ...string)
 	c.generationMu.RLock()
 	defer c.generationMu.RUnlock()
 
+	// Lock every target in a stable order, including keys not yet staged. A
+	// failed transaction cannot remove a newer Store/Freshen generation, and
+	// overlapping transactions cannot deadlock with reversed key lists.
+	keys, unlock := c.lockStoreKeys(keys)
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if c.responseSuperseded(res, keys) {
 		return nil
 	}
 
-	expectedSize, hasExpectedSize := expectedBodySize(res.Header())
-	for _, key := range keys {
-		if err := c.storeResourceForKey(ctx, res, key, expectedSize, hasExpectedSize); err != nil {
-			return err
+	prepared := make([]*preparedCacheEntry, len(keys))
+	for i, key := range keys {
+		prepared[i] = &preparedCacheEntry{key: key, hashedKey: hashKey(key), storedAt: Clock()}
+		// Protect all old variants before admission can evict any of them.
+		c.beginReservation(prepared[i].hashedKey)
+		defer c.releaseReservation(prepared[i].hashedKey)
+	}
+
+	// Generic VFS backends cannot rename staged files. Hide their in-place
+	// multi-key writes from readers until either every key succeeds or every
+	// affected key is discarded. Native disk staging remains concurrent.
+	locked := c.diskRoot == "" && len(keys) > 1
+	if locked {
+		c.publishMu.Lock()
+	}
+	defer func() {
+		if locked {
+			c.publishMu.Unlock()
 		}
+	}()
+	fail := func(err error) error {
+		if !locked {
+			c.publishMu.Lock()
+			locked = true
+		}
+		return c.discardPreparedStore(err, prepared)
+	}
+
+	expectedSize, hasExpectedSize := expectedBodySize(res.Header())
+	var files []*stagedEntry
+	for _, entry := range prepared {
+		if err := c.prepareResourceForKey(ctx, res, entry, expectedSize, hasExpectedSize); err != nil {
+			return fail(err)
+		}
+		files = append(files, entry.body, entry.header)
+	}
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	if !locked {
+		c.publishMu.Lock()
+		locked = true
+	}
+	// Cancellation may arrive while waiting for another publication.
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	if err := c.commitStagedLocked(files...); err != nil {
+		return fail(err)
+	}
+	for _, entry := range prepared {
+		c.trackEntry(entry.key, entry.hashedKey, entry.size, entry.storedAt)
 	}
 	return nil
+}
+
+// lockStoreKeys deduplicates target hashes while preserving the caller's key
+// order for staging. Only lock acquisition is sorted.
+func (c *cache) lockStoreKeys(keys []string) ([]string, func()) {
+	unique := make([]string, 0, len(keys))
+	hashes := make([]string, 0, len(keys))
+	seen := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		hashed := hashKey(key)
+		if !seen[hashed] {
+			seen[hashed] = true
+			unique = append(unique, key)
+			hashes = append(hashes, hashed)
+		}
+	}
+	sort.Strings(hashes)
+	unlocks := make([]func(), 0, len(hashes))
+	for _, hashed := range hashes {
+		unlocks = append(unlocks, c.lockKeyWriter(hashed))
+	}
+	return unique, func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
+	}
+}
+
+// preparedCacheEntry retains admission and staging state until all keys can
+// be published together. Its size also accounts for failed in-place writes.
+type preparedCacheEntry struct {
+	key, hashedKey string
+	storedAt       time.Time
+	body, header   *stagedEntry
+	size           int64
+}
+
+// discardPreparedStore requires all target writer locks and publishMu. Disk
+// staging failures leave the old generation intact. If a VFS write or rename
+// has published anything, discard all transaction keys, including untouched
+// old variants, before readers or newer writers can reach a mixed generation.
+func (c *cache) discardPreparedStore(err error, entries []*preparedCacheEntry) error {
+	published := false
+	for _, entry := range entries {
+		published = published || anyPublished(entry.body, entry.header)
+		c.abandonStaged(entry.body, entry.header)
+	}
+	if !published {
+		return err
+	}
+	for _, entry := range entries {
+		if discardErr := c.discardUnadmitted(entry.key, entry.hashedKey, entry.size, entry.storedAt); discardErr != nil {
+			// A backend refusing removal must not serve its residual generation
+			// as fresh. Preserve a concurrent Invalidate barrier if present.
+			c.staleMutex.Lock()
+			if now := Clock(); c.stale[entry.key].Before(now) {
+				c.stale[entry.key] = now
+			}
+			c.persistStale(c.snapshotStaleLocked())
+			c.staleMutex.Unlock()
+			err = errors.Join(err, fmt.Errorf("discard entry after failed store for key %q: %w", entry.key, discardErr))
+		}
+	}
+	return err
 }
 
 // responseSuperseded checks every governing key before any entry is changed.
@@ -745,15 +871,10 @@ func expectedBodySize(h http.Header) (int64, bool) {
 	return length, true
 }
 
-// storeResourceForKey stages, admits, and publishes one entry. The caller
-// holds generationMu so invalidation cannot finalize between these steps.
-func (c *cache) storeResourceForKey(ctx context.Context, res *Resource, key string, expectedSize int64, hasExpectedSize bool) error {
-	hashedKey := hashKey(key)
-	unlock := c.lockKeyWriter(hashedKey)
-	defer unlock()
-	// Protect an existing entry even while an unknown-length body is staged.
-	c.beginReservation(hashedKey)
-	defer c.releaseReservation(hashedKey)
+// prepareResourceForKey stages and admits one entry without publishing it.
+// The caller holds generationMu and every transaction target's writer lock.
+func (c *cache) prepareResourceForKey(ctx context.Context, res *Resource, entry *preparedCacheEntry, expectedSize int64, hasExpectedSize bool) error {
+	key, hashedKey := entry.key, entry.hashedKey
 	if _, err := res.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("failed to rewind resource for key %q: %w", key, err)
 	}
@@ -768,7 +889,7 @@ func (c *cache) storeResourceForKey(ctx context.Context, res *Resource, key stri
 	// pre-mutation response as fresh, and refetching ONE Vary variant
 	// cleared the base marker that every OTHER variant is still judged
 	// against. The cleanup goroutine expires markers on its own.
-	storedAt := Clock()
+	storedAt := entry.storedAt
 	headerData, err := c.serializeCacheHeader(res.Status(), res.Header(), storedAt, key, expectedSize, strings.Repeat("0", 64))
 	if err != nil {
 		return fmt.Errorf("failed to serialize headers for key %q: %w", key, err)
@@ -798,55 +919,33 @@ func (c *cache) storeResourceForKey(ctx context.Context, res *Resource, key stri
 		body = io.TeeReader(body, digest)
 	}
 	bodyStaged, written, err := c.stageBodyContext(ctx, body, key)
-	fail := func(err error) error {
-		return c.discardFailedStore(err, key, hashedKey, bodyStaged, written+int64(len(headerData)), storedAt)
-	}
+	entry.body = bodyStaged
+	entry.size = written + int64(len(headerData))
 	if err != nil {
-		return fail(err)
+		return err
 	}
 	if hasExpectedSize && written != expectedSize {
-		return fail(fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize))
+		return fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize)
 	}
 	headerData, err = c.serializeCacheHeader(res.Status(), res.Header(), storedAt, key, written, fmt.Sprintf("%x", digest.Sum(nil)))
 	if err != nil {
-		return fail(err)
+		return err
 	}
 	if err := c.reserveEntry(hashedKey, written+int64(len(headerData))); err != nil {
-		return fail(fmt.Errorf("failed to make room for key %q: %w", key, err))
+		return fmt.Errorf("failed to make room for key %q: %w", key, err)
 	}
 
 	headerStaged, headerBytes, err := c.stageSerializedHeaderContext(ctx, headerData, key)
+	entry.header = headerStaged
+	entry.size = written + headerBytes
 	if err == nil {
 		err = ctx.Err()
 	}
 	if err != nil {
-		c.abandonStaged(headerStaged)
-		return fail(err)
+		return err
 	}
 
-	// One step, under publishMu: a reader sees the whole previous entry or
-	// the whole new one, never one version's body with the other's header.
-	if err := c.commitStaged(bodyStaged, headerStaged); err != nil {
-		c.abandonStaged(bodyStaged, headerStaged)
-		return fail(err)
-	}
-
-	// Update LRU tracking
-	c.trackEntry(key, hashedKey, written+headerBytes, storedAt)
 	return nil
-}
-
-// discardFailedStore preserves a previous entry if staging never published
-// anything. An in-place write or partially completed commit must instead
-// remove the changed entry, retaining its size for cleanup if removal fails.
-func (c *cache) discardFailedStore(err error, key, hashedKey string, body *stagedEntry, residualSize int64, storedAt time.Time) error {
-	c.abandonStaged(body)
-	if anyPublished(body) {
-		if discardErr := c.discardUnadmitted(key, hashedKey, residualSize, storedAt); discardErr != nil {
-			err = errors.Join(err, fmt.Errorf("discard entry after failed store for key %q: %w", key, discardErr))
-		}
-	}
-	return err
 }
 
 func (c *cache) stageBody(r io.Reader, key string) (*stagedEntry, int64, error) {
