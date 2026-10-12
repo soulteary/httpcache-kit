@@ -197,6 +197,88 @@ func TestMissCoordinatorWaitingRequestCancellation(t *testing.T) {
 	}
 }
 
+type featureCoordinatorFunc func(context.Context, string) (MissLease, error)
+
+func (f featureCoordinatorFunc) Acquire(ctx context.Context, key string) (MissLease, error) {
+	return f(ctx, key)
+}
+
+type featureLeaseFunc struct {
+	ctx   context.Context
+	close func()
+	once  sync.Once
+}
+
+func (l *featureLeaseFunc) Context() context.Context { return l.ctx }
+func (l *featureLeaseFunc) Close() error {
+	l.once.Do(l.close)
+	return nil
+}
+
+type featureRecheckCache struct {
+	Cache
+	recheck func()
+}
+
+func (c *featureRecheckCache) Retrieve(key string) (*Resource, error) {
+	c.recheck()
+	return c.Cache.Retrieve(key)
+}
+
+func TestMissCoordinatorLeaseCancellationAfterAcquisition(t *testing.T) {
+	for _, cancelClient := range []bool{false, true} {
+		t.Run(map[bool]string{false: "live-client", true: "canceled-client"}[cancelClient], func(t *testing.T) {
+			c := NewMemoryCacheWithConfig(&CacheConfig{})
+			defer func() { _ = c.Close() }()
+			clientCtx, endClient := context.WithCancel(context.Background())
+			defer endClient()
+			var endLease context.CancelFunc
+			var closed, upstreamCalls int
+			coordinator := featureCoordinatorFunc(func(ctx context.Context, _ string) (MissLease, error) {
+				leaseCtx, cancel := context.WithCancel(ctx)
+				endLease = cancel
+				return &featureLeaseFunc{ctx: leaseCtx, close: func() { closed++; cancel() }}, nil
+			})
+			cache := &featureRecheckCache{Cache: c, recheck: func() {
+				// Cancel ownership during the cache recheck, after Acquire has
+				// returned a live lease but before the upstream fetch starts.
+				if endLease != nil {
+					endLease()
+					if cancelClient {
+						endClient()
+					}
+				}
+			}}
+			h := NewHandlerWithOptions(cache, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				upstreamCalls++
+			}), &HandlerOptions{MissCoordinator: coordinator})
+			for attempt := 1; attempt <= 2; attempt++ {
+				endLease = nil
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest("GET", "https://origin.test/lease", nil).WithContext(clientCtx))
+				if !cancelClient && (rec.Code != http.StatusServiceUnavailable || rec.Body.String() != "cache fill coordination unavailable\n") {
+					t.Fatalf("lost ownership reported success: status=%d body=%q", rec.Code, rec.Body.String())
+				}
+				if cancelClient && rec.Body.Len() != 0 {
+					t.Fatalf("response written after client cancellation: %q", rec.Body.String())
+				}
+				if upstreamCalls != 0 || closed != attempt {
+					t.Fatalf("lease cancellation: upstream=%d released=%d attempt=%d", upstreamCalls, closed, attempt)
+				}
+				h.flightsMu.Lock()
+				remaining := len(h.flights)
+				h.flightsMu.Unlock()
+				if remaining != 0 {
+					t.Fatalf("lost ownership stranded %d local flights", remaining)
+				}
+				if cancelClient {
+					break
+				}
+			}
+		})
+	}
+}
+
 func TestRequestKeyPolicyPreservesVaryAndInvalidationOrigin(t *testing.T) {
 	c := NewMemoryCacheWithConfig(&CacheConfig{})
 	defer func() { _ = c.Close() }()
@@ -249,5 +331,67 @@ func TestRequestKeyPolicyErrorRejectsBeforeUpstream(t *testing.T) {
 	u, _ := url.Parse("https://logical.test/object")
 	if NewKey("GET", u, nil).String() == NewKey("HEAD", u, nil).String() {
 		t.Fatal("method keys collide")
+	}
+}
+
+func TestRequestKeyPolicyInvalidationUsesTargetRequestFields(t *testing.T) {
+	for _, originForm := range []bool{false, true} {
+		t.Run(map[bool]string{false: "absolute-url", true: "origin-url"}[originForm], func(t *testing.T) {
+			c := NewMemoryCacheWithConfig(&CacheConfig{})
+			defer func() { _ = c.Close() }()
+			policy := func(r *http.Request) (Key, error) {
+				// Applications may inspect RequestURI and Host when deriving a
+				// logical identity. The callback must see a coherent target request.
+				if r.RequestURI != r.URL.RequestURI() || (r.URL.Host != "" && r.Host != r.URL.Host) {
+					return Key{}, errors.New("inconsistent request target")
+				}
+				u, err := url.ParseRequestURI(r.RequestURI)
+				if err != nil {
+					return Key{}, err
+				}
+				u.Scheme, u.Host = "http", r.Host
+				return NewKey(r.Method, u, r.Header), nil
+			}
+			const location = "/neighbor%2Fencoded?arch=arm64&arch=amd64"
+			const contentLocation = "http://ORIGIN.test:80/empty-query?"
+			h := NewHandlerWithOptions(c, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Location", location)
+				w.Header().Set("Content-Location", contentLocation)
+				w.WriteHeader(http.StatusOK)
+			}), &HandlerOptions{RequestKey: policy})
+			mutation := httptest.NewRequest("POST", "http://origin.test/mutation?source=old", nil)
+			mutation.RequestURI = mutation.URL.RequestURI()
+			if originForm {
+				mutation.URL.Scheme, mutation.URL.Host = "", ""
+			}
+			originalURL, originalURI, originalHost := mutation.URL.String(), mutation.RequestURI, mutation.Host
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, mutation)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("mutation status=%d body=%q", rec.Code, rec.Body.String())
+			}
+			for _, target := range []string{"http://origin.test/mutation?source=old", "http://origin.test" + location, contentLocation} {
+				direct := httptest.NewRequest("GET", target, nil)
+				direct.RequestURI = direct.URL.RequestURI()
+				if originForm {
+					// Origin-form invalidation retains the request authority, as
+					// same-origin absolute Location references do not change it.
+					direct.Host = mutation.Host
+					direct.URL.Scheme, direct.URL.Host = "", ""
+				}
+				key, err := policy(direct)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, method := range []string{http.MethodGet, http.MethodHead} {
+					if _, stale := c.(staleAtChecker).StaleAt(key.ForMethod(method).String()); !stale {
+						t.Fatalf("target remained fresh for %s %s", method, target)
+					}
+				}
+			}
+			if mutation.URL.String() != originalURL || mutation.RequestURI != originalURI || mutation.Host != originalHost {
+				t.Fatal("invalidation changed the original mutation request")
+			}
+		})
 	}
 }
