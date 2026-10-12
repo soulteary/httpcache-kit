@@ -22,15 +22,15 @@
 
 ### gocyclo
 
+- `cache.go`
+  - Line 597: cyclomatic complexity 23 for function (*cache).Store
+- `invalidate_internal_test.go`
+  - Line 1365: cyclomatic complexity 21 for function TestValidationRefetchesWhenInvalidatedDuringFreshen
 - `handler.go`
   - Line 191: cyclomatic complexity 24 for function (*Handler).ServeHTTP
   - Line 1135: cyclomatic complexity 23 for function (*cacheRequest).sameOriginURL
   - Line 661: cyclomatic complexity 22 for function (*Handler).isCacheable
   - Line 1005: cyclomatic complexity 16 for function (*Handler).lookup
-- `cache.go`
-  - Line 597: cyclomatic complexity 23 for function (*cache).Store
-- `invalidate_internal_test.go`
-  - Line 1365: cyclomatic complexity 21 for function TestValidationRefetchesWhenInvalidatedDuringFreshen
 
 ---
 
