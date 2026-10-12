@@ -79,7 +79,7 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 		_ = exchange.reader.Close()
 		return false, false
 	}
-	if fullResponseVaryChanged(exchange.status, res.Header(), exchange.snapshot) ||
+	if h.fullResponseVaryChanged(&validation, exchange.status, res.Header(), exchange.snapshot) ||
 		varyChangedClientValidators(combinedHeaderValues(exchange.snapshot, "Vary"), req.Request, out) {
 		// A changed selection policy needs the discovery key fenced too, and a
 		// rewritten selecting validator can produce another representation.
@@ -109,10 +109,15 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 	return false, true
 }
 
-func fullResponseVaryChanged(status int, previous, replacement http.Header) bool {
-	_, canStore := storeable[status]
-	return (canStore || status >= http.StatusOK && status < http.StatusMultipleChoices) &&
-		!sameVaryFields(combinedHeaderValues(previous, "Vary"), combinedHeaderValues(replacement, "Vary"))
+func (h *Handler) fullResponseVaryChanged(req *cacheRequest, status int, previous, replacement http.Header) bool {
+	if sameVaryFields(combinedHeaderValues(previous, "Vary"), combinedHeaderValues(replacement, "Vary")) {
+		return false
+	}
+	// Preserve successful-response rebuilding, and also fence policies from
+	// cacheable redirects and negative responses. Uncacheable errors must keep
+	// their original status/body rather than being replaced by another fetch.
+	return (status >= http.StatusOK && status < http.StatusMultipleChoices) ||
+		h.isCacheable(NewResourceBytes(status, nil, replacement), req)
 }
 
 func (req *cacheRequest) validationResourceKey() string {
