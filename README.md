@@ -249,6 +249,18 @@ A custom VFS must account for its own buffers. `StoreContext` cooperatively
 checks cancellation between reads/writes; it cannot interrupt an arbitrary
 blocking Reader or VFS call.
 
+With a handler staging budget, admission refused before streaming is reported
+in the initial `X-Cache: SKIP` header. An admitted HTTP/1.1 or HTTP/2 response
+with a body declares the `X-Cache-Staging` trailer: read the complete body to
+observe `ADMITTED` or a later `SKIP` caused by refused reservation or failed
+temporary storage. This reports only handler-body staging; asynchronous cache
+Store can still fail afterward. HTTP/1.1 budgeted responses use chunked framing
+instead of the origin's `Content-Length`; the cached origin metadata is retained.
+HTTP/1.0 budgeted responses bypass staging and report `X-Cache: SKIP`, since that
+protocol cannot transmit the final trailer. Budgeted HEAD and origin responses
+with a bodyless status also bypass staging and report `SKIP`. Cached hits remain
+available; responses without a handler budget retain their framing.
+
 `RequestKey` is a trusted callback returning a `Key`; it changes cache identity
 without changing the upstream URL. Preserve method and Vary separation and
 merge only independently verified identical objects. Never let an untrusted

@@ -22,6 +22,9 @@ import (
 const (
 	CacheHeader     = "X-Cache"
 	ProxyDateHeader = "Proxy-Date"
+	// CacheStagingHeader reports synchronous handler-body staging admission.
+	// It does not report the result of the subsequent asynchronous cache Store.
+	CacheStagingHeader = "X-Cache-Staging"
 )
 
 var Writes sync.WaitGroup
@@ -620,6 +623,16 @@ func (h *Handler) passUpstreamWithHandler(w http.ResponseWriter, r *cacheRequest
 		upstream.ServeHTTP(w, r.Request)
 		return
 	}
+	if h.stagingBudget != nil {
+		rw.deferHeaders = true
+		if deferred, ok := w.(interface {
+			DeferStagingHeaders()
+			FinishStagingHeaders()
+		}); ok {
+			deferred.DeferStagingHeaders()
+			defer deferred.FinishStagingHeaders()
+		}
+	}
 	rdr, err := rw.NextReader()
 	if err != nil {
 		defer callComplete(complete)
@@ -647,19 +660,22 @@ func (h *Handler) passUpstreamWithHandler(w http.ResponseWriter, r *cacheRequest
 	// to order an in-flight response against a concurrent invalidation without
 	// relying on second-granular HTTP dates.
 	res.RequestTime = t
-	if !h.isCacheable(res, r) {
+	if !h.canStageResponse(res, r) {
 		h.debugf("resource is uncacheable")
+		rw.commitStagingHeaders(r.Request, "SKIP", false)
 		// Drain body so upstream goroutine can finish and client receives the response
 		_, _ = io.Copy(io.Discard, rdr)
 		_ = rdr.Close()
 		// The upstream has finished before the pipe closes, so changing the
 		// wrapped live headers here cannot race trailer publication.
 		rw.Header().Set(CacheHeader, "SKIP")
+		rw.finishStaging("SKIP")
 		callComplete(complete)
 		return
 	}
 
 	stage, err := newHandlerStage(r.Context(), h.tempDir, h.stagingBudget)
+	rw.commitStagingHeaders(r.Request, "MISS", err == nil)
 	if err == nil {
 		_, err = io.Copy(&stagingWriter{ctx: r.Context(), w: stage.File, lease: stage.lease}, rdr)
 	}
@@ -673,15 +689,19 @@ func (h *Handler) passUpstreamWithHandler(w http.ResponseWriter, r *cacheRequest
 		_, _ = io.Copy(io.Discard, rdr)
 		_ = rdr.Close()
 		rw.Header().Set(CacheHeader, "SKIP")
+		rw.finishStaging("SKIP")
 		callComplete(complete)
 		return
 	}
 	_ = rdr.Close()
 	if _, err := stage.Seek(0, io.SeekStart); err != nil {
 		_ = stage.Close()
+		rw.Header().Set(CacheHeader, "SKIP")
+		rw.finishStaging("SKIP")
 		callComplete(complete)
 		return
 	}
+	rw.finishStaging("ADMITTED")
 	upstreamDuration := Clock().Sub(t)
 	res.ReadSeekCloser = stage
 
@@ -704,6 +724,18 @@ func (h *Handler) passUpstreamWithHandler(w http.ResponseWriter, r *cacheRequest
 
 	// Store resource in background - errors won't affect client response
 	h.storeResource(res, r, complete)
+}
+
+func (h *Handler) canStageResponse(res *Resource, r *cacheRequest) bool {
+	// Protocols/statuses without body trailers cannot convey a later Reserve
+	// refusal. Avoid staging a body whose final outcome could be invisible.
+	return (h.stagingBudget == nil || canConveyStaging(r.Request, res.Status())) && h.isCacheable(res, r)
+}
+
+func canConveyStaging(req *http.Request, status int) bool {
+	return req.ProtoAtLeast(1, 1) && req.Method != http.MethodHead &&
+		status >= http.StatusOK && status != http.StatusNoContent &&
+		status != http.StatusResetContent && status != http.StatusNotModified
 }
 
 func callComplete(complete func()) {
@@ -1520,8 +1552,8 @@ type responseStreamer struct {
 	http.ResponseWriter
 	pipeReader *io.PipeReader
 	pipeWriter *io.PipeWriter
-	// deferHeaders keeps a state-changing response private until its cache
-	// invalidation has completed. Header must therefore return bufferedHeader
+	// deferHeaders keeps initial metadata private until invalidation or staging
+	// admission has completed. Header must therefore return bufferedHeader
 	// rather than exposing the wrapped writer's live header map.
 	deferHeaders   bool
 	bufferedHeader http.Header
@@ -1529,6 +1561,10 @@ type responseStreamer struct {
 	// StatusCode. It is published by closing C, so WaitHeaders observes both,
 	// even when the actual client commit is deliberately deferred.
 	responseHeader http.Header
+	// clientHeader may change delivery framing or report staging refusal while
+	// responseHeader retains the origin metadata used for cache storage.
+	clientHeader   http.Header
+	stagingTrailer bool
 	// C is closed by WriteHeader to signal the headers' writing. headerOnce ensures it is closed at most once.
 	C          chan struct{}
 	commitC    chan struct{}
@@ -1538,8 +1574,8 @@ type responseStreamer struct {
 }
 
 // Header implements http.ResponseWriter. Ordinary responses retain the
-// wrapped writer's behavior. State-changing responses use a private copy so
-// neither their status nor headers become observable before invalidation.
+// wrapped writer's behavior. Deferred responses use a private copy until their
+// invalidation or staging admission decision permits the client commit.
 func (rw *responseStreamer) Header() http.Header {
 	if !rw.deferHeaders || rw.committed.Load() {
 		return rw.ResponseWriter.Header()
@@ -1579,8 +1615,8 @@ func (rw *responseStreamer) WriteHeader(status int) {
 }
 
 // CommitHeaders makes the first status and its header snapshot observable to
-// the client. For a state-changing request pipeUpstream calls this only after
-// successful-response invalidation is complete.
+// the client. Callers first complete successful-response invalidation or the
+// initial staging admission decision when headers are deferred.
 func (rw *responseStreamer) CommitHeaders() {
 	rw.commitOnce.Do(func() {
 		if rw.deferHeaders {
@@ -1588,7 +1624,11 @@ func (rw *responseStreamer) CommitHeaders() {
 			for name := range dst {
 				delete(dst, name)
 			}
-			for name, values := range rw.responseHeader {
+			header := rw.responseHeader
+			if rw.clientHeader != nil {
+				header = rw.clientHeader
+			}
+			for name, values := range header {
 				dst[name] = append([]string(nil), values...)
 			}
 		}
@@ -1601,6 +1641,45 @@ func (rw *responseStreamer) CommitHeaders() {
 			close(rw.commitC)
 		}
 	})
+}
+
+// commitStagingHeaders preserves the origin snapshot while making early
+// refusals visible and arranging a writable outcome for later refusals.
+func (rw *responseStreamer) commitStagingHeaders(req *http.Request, status string, admitted bool) {
+	if !rw.deferHeaders {
+		return
+	}
+	rw.clientHeader = rw.responseHeader.Clone()
+	if !admitted {
+		status = "SKIP"
+	}
+	rw.clientHeader.Set(CacheHeader, status)
+	rw.stagingTrailer = admitted && canConveyStaging(req, rw.StatusCode)
+	if rw.stagingTrailer {
+		rw.clientHeader.Add("Trailer", CacheStagingHeader)
+		if req.ProtoMajor == 1 {
+			// HTTP/1.1 trailers require chunked framing. Keep the origin length
+			// in responseHeader so storage and subsequent hits remain unchanged.
+			rw.clientHeader.Del("Content-Length")
+			if strings.EqualFold(rw.clientHeader.Get("Transfer-Encoding"), "identity") {
+				rw.clientHeader.Del("Transfer-Encoding")
+			}
+		}
+	}
+	rw.CommitHeaders()
+}
+
+// finishStaging is called only after the upstream has finished its writes and
+// trailer updates. The background Store must never write to ResponseWriter.
+func (rw *responseStreamer) finishStaging(status string) {
+	if rw.deferHeaders {
+		// An origin may retain the Header map it obtained before WriteHeader.
+		// Publish its trailers now that its goroutine no longer mutates that map.
+		copyValidationTrailers(rw.Header(), rw.bufferedHeader, rw.responseHeader)
+	}
+	if rw.stagingTrailer {
+		rw.Header().Set(CacheStagingHeader, status)
+	}
 }
 
 // Write implements http.ResponseWriter.

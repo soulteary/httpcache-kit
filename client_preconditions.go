@@ -3,6 +3,7 @@ package httpcache
 import (
 	"bytes"
 	"net/http"
+	"strings"
 )
 
 // Validation uses the cache's validator. Delivery must still apply the client's
@@ -14,6 +15,12 @@ type clientPreconditionWriter struct {
 	req      *http.Request
 	header   http.Header
 	suppress bool
+	// A client condition can suppress delivery while the complete origin body
+	// still needs bounded staging. Delay only that response's metadata so a
+	// later refusal can be reported without relying on body trailers.
+	deferStaging  bool
+	pendingStatus int
+	pendingHeader http.Header
 }
 
 func newClientPreconditionWriter(w http.ResponseWriter, req *http.Request) http.ResponseWriter {
@@ -39,6 +46,14 @@ func (w *clientPreconditionWriter) WriteHeader(status int) {
 			status, header, w.suppress = probe.status, probe.header, true
 		}
 	}
+	if w.deferStaging && w.suppress {
+		w.pendingStatus, w.pendingHeader = status, header
+		return
+	}
+	w.commitHeader(status, header)
+}
+
+func (w *clientPreconditionWriter) commitHeader(status int, header http.Header) {
 	dst := w.ResponseWriter.Header()
 	for name := range dst {
 		delete(dst, name)
@@ -47,6 +62,43 @@ func (w *clientPreconditionWriter) WriteHeader(status int) {
 		dst[name] = append([]string(nil), values...)
 	}
 	w.ResponseWriter.WriteHeader(status)
+}
+
+// DeferStagingHeaders lets the handler postpone a conditional response with
+// no delivered body until its synchronous staging outcome is known.
+func (w *clientPreconditionWriter) DeferStagingHeaders() { w.deferStaging = true }
+
+// FinishStagingHeaders commits a suppressed response once. Preserve the
+// precondition probe's bodyless header filtering and copy only the cache
+// metadata that the main path is allowed to update after origin WriteHeader.
+// Origin trailer updates remain private and never become initial headers.
+func (w *clientPreconditionWriter) FinishStagingHeaders() {
+	if w.pendingStatus == 0 {
+		w.finishTrailers()
+		return
+	}
+	header := w.pendingHeader
+	for _, name := range []string{CacheHeader, "Age", ProxyDateHeader} {
+		if values, ok := w.header[name]; ok {
+			header[name] = append([]string(nil), values...)
+		} else {
+			delete(header, name)
+		}
+	}
+	header.Del("Trailer")
+	header.Del(CacheStagingHeader)
+	// A 412 probe can retain the origin's full-body length. The delivered
+	// response contains no body, so that framing must not reach the client.
+	header.Del("Content-Length")
+	header.Del("Transfer-Encoding")
+	for name := range header {
+		if strings.HasPrefix(name, http.TrailerPrefix) {
+			delete(header, name)
+		}
+	}
+	status := w.pendingStatus
+	w.pendingStatus, w.pendingHeader = 0, nil
+	w.commitHeader(status, header)
 }
 func (w *clientPreconditionWriter) Write(body []byte) (int, error) {
 	if w.suppress {

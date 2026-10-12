@@ -110,7 +110,8 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 }
 
 func fullResponseVaryChanged(status int, previous, replacement http.Header) bool {
-	return status >= http.StatusOK && status < http.StatusMultipleChoices &&
+	_, canStore := storeable[status]
+	return (canStore || status >= http.StatusOK && status < http.StatusMultipleChoices) &&
 		!sameVaryFields(combinedHeaderValues(previous, "Vary"), combinedHeaderValues(replacement, "Vary"))
 }
 

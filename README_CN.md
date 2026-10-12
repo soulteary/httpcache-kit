@@ -588,6 +588,15 @@ Windows 使用命名文件，在关闭时删除。空间不足时继续排空上
 日志与自定义 VFS 缓冲不在此钩子内，自定义 VFS 需要自行计量。
 `StoreContext` 在流读写之间协作检查取消，不能打断任意阻塞 Reader 或 VFS 调用。
 
+启用 Handler 暂存预算后，在正文开始前拒绝准入时，首次响应头即为 `X-Cache: SKIP`。
+HTTP/1.1 或 HTTP/2 的有正文响应在准入后声明 `X-Cache-Staging` trailer；完整读取
+正文后，可见 `ADMITTED` 或因后续预留拒绝、临时存储失败而产生的 `SKIP`。它只表示
+Handler 正文暂存结果，后台异步 Store 仍可能随后失败。HTTP/1.1 使用 chunked 传输
+取代上游 `Content-Length`，缓存保留上游原始元数据。HTTP/1.0 无法发送最终 trailer，
+因此启用预算时跳过暂存，并在首次响应头报告 `X-Cache: SKIP`。启用预算的 HEAD
+请求及上游无正文状态响应同样跳过暂存并报告 `SKIP`；已有缓存仍可命中。未启用
+Handler 预算的响应保留原有传输方式。
+
 `HandlerOptions.RequestKey` 是受信任的逻辑身份策略，返回 `Key`，不修改上游 URL。
 只合并已经独立确认内容身份一致的对象，并保留方法与 Vary 隔离，不应由不受信任请求头
 选择其他对象的键。非安全方法的失效操作也使用该策略，并保持 Location/
