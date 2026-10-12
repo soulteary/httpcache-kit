@@ -417,3 +417,83 @@ func TestShared304MetadataPolicyAndPrivacy(t *testing.T) {
 		})
 	}
 }
+
+func TestExternallyConstructedCacheControlKeepsMixedCaseEntries(t *testing.T) {
+	for _, spelling := range []string{"MAX-AGE", "mAx-AgE"} {
+		t.Run(spelling, func(t *testing.T) {
+			cc := CacheControl{spelling: {"60"}, "No-Store": {}}
+			before := CacheControl{spelling: {"60"}, "No-Store": {}}
+			for _, query := range []string{"max-age", "MAX-AGE", "mAx-AgE"} {
+				if value, exists := cc.Get(query); !exists || value != "60" {
+					t.Fatalf("literal lookup %q: value=%q exists=%v", query, value, exists)
+				}
+				if !cc.Has(query) {
+					t.Fatalf("literal Has(%q) false", query)
+				}
+				if duration, err := cc.Duration(query); err != nil || duration != time.Minute {
+					t.Fatalf("literal Duration(%q)=%v err=%v", query, duration, err)
+				}
+			}
+			if value, exists := cc.Get("NO-STORE"); !exists || value != "" {
+				t.Fatalf("mixed-case flag lookup: value=%q exists=%v", value, exists)
+			}
+			if !reflect.DeepEqual(cc, before) {
+				t.Fatal("reading directives mutated caller's map")
+			}
+			cc.Add("max-age", "120")
+			cc.Add("MAX-AGE", "180")
+			cc.Add("NO-STORE", "")
+			if len(cc) != 2 || !reflect.DeepEqual(cc[spelling], []string{"60", "120", "180"}) {
+				t.Fatalf("Add split or renamed externally constructed directive: %v", cc)
+			}
+			cc.Add("PUBLIC", "")
+			if !cc.Has("public") || len(cc) != 3 {
+				t.Fatalf("new directive was not normalized: %v", cc)
+			}
+		})
+	}
+}
+
+func TestSMaxageOnlyUsesPrivateHeuristicFreshness(t *testing.T) {
+	for _, policy := range []string{"s-maxage=0", "s-maxage=60"} {
+		for _, shared := range []bool{false, true} {
+			t.Run(policy+"/shared="+stringBool(shared), func(t *testing.T) {
+				var hits atomic.Int64
+				h := NewHandler(NewMemoryCache(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					hits.Add(1)
+					w.Header().Set("Cache-Control", policy)
+					w.Header().Set("Last-Modified", time.Now().UTC().Add(-24*time.Hour).Format(http.TimeFormat))
+					if r.Header.Get("If-Modified-Since") != "" {
+						w.WriteHeader(304)
+						return
+					}
+					_, _ = io.WriteString(w, "metadata")
+				}))
+				h.Shared = shared
+				t.Cleanup(func() { h.writes.Wait() })
+				for i := 0; i < 2; i++ {
+					rec := httptest.NewRecorder()
+					h.ServeHTTP(rec, httptest.NewRequest("GET", "http://cache.example/InRelease", nil))
+					h.writes.Wait()
+					if rec.Code != 200 || rec.Body.String() != "metadata" {
+						t.Fatalf("response=%d %q", rec.Code, rec.Body.String())
+					}
+				}
+				wantHits := int64(1)
+				if shared && policy == "s-maxage=0" {
+					wantHits = 2
+				}
+				if hits.Load() != wantHits {
+					t.Fatalf("profile ignored shared-only freshness: policy=%s shared=%v hits=%d want=%d", policy, shared, hits.Load(), wantHits)
+				}
+				res := NewResourceBytes(200, nil, http.Header{"Cache-Control": {policy}, "Last-Modified": {time.Now().UTC().Add(-24 * time.Hour).Format(http.TimeFormat)}})
+				if !res.HasExplicitExpiration() {
+					t.Fatal("public metadata predicate no longer recognizes s-maxage")
+				}
+				if res.heuristicFreshness(false) <= 0 || res.heuristicFreshness(true) != 0 {
+					t.Fatal("heuristic expiration was not cache-profile aware")
+				}
+			})
+		}
+	}
+}

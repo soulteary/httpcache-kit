@@ -74,7 +74,8 @@ func ParseCacheControl(input string) (CacheControl, error) {
 }
 
 func (cc CacheControl) Get(key string) (string, bool) {
-	v, exists := cc[strings.ToLower(key)]
+	storedKey, exists := cc.lookupKey(key)
+	v := cc[storedKey]
 	if exists && len(v) > 0 {
 		return v[0], true
 	}
@@ -82,8 +83,12 @@ func (cc CacheControl) Get(key string) (string, bool) {
 }
 
 func (cc CacheControl) Add(key, val string) {
-	key = strings.ToLower(key)
-	if !cc.Has(key) {
+	if storedKey, exists := cc.lookupKey(key); exists {
+		// Preserve the spelling of entries constructed through the exported
+		// map type, rather than creating a second directive under a new key.
+		key = storedKey
+	} else {
+		key = strings.ToLower(key)
 		cc[key] = []string{}
 	}
 	if val != "" {
@@ -92,8 +97,28 @@ func (cc CacheControl) Add(key, val string) {
 }
 
 func (cc CacheControl) Has(key string) bool {
-	_, exists := cc[strings.ToLower(key)]
+	_, exists := cc.lookupKey(key)
 	return exists
+}
+
+// Parsed directives use lowercase keys, but callers may also build this
+// exported map directly. Keep the common lookup fast and recognize existing
+// mixed-case entries without mutating the map during reads.
+func (cc CacheControl) lookupKey(key string) (string, bool) {
+	lower := strings.ToLower(key)
+	if _, exists := cc[lower]; exists {
+		return lower, true
+	}
+	if _, exists := cc[key]; exists {
+		return key, true
+	}
+	var found string
+	for candidate := range cc {
+		if strings.EqualFold(candidate, key) && (found == "" || candidate < found) {
+			found = candidate
+		}
+	}
+	return found, found != ""
 }
 
 func (cc CacheControl) Duration(key string) (time.Duration, error) {

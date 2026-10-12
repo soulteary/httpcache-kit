@@ -270,6 +270,12 @@ func (r *Resource) HasValidators() bool {
 }
 
 func (r *Resource) HasExplicitExpiration() bool {
+	return r.hasExplicitExpiration(true)
+}
+
+// s-maxage applies only to shared caches. Keep the public metadata predicate
+// unchanged while the handler evaluates expiration using its own profile.
+func (r *Resource) hasExplicitExpiration(shared bool) bool {
 	cc, err := r.cacheControl()
 	if err != nil {
 		debugf("Error parsing Cache-Control: %s", err.Error())
@@ -280,7 +286,7 @@ func (r *Resource) HasExplicitExpiration() bool {
 		return true
 	}
 
-	if cc.Has("s-maxage") {
+	if shared && cc.Has("s-maxage") {
 		return true
 	}
 
@@ -292,7 +298,11 @@ func (r *Resource) HasExplicitExpiration() bool {
 }
 
 func (r *Resource) HeuristicFreshness() time.Duration {
-	if !r.HasExplicitExpiration() && r.header.Get("Last-Modified") != "" {
+	return r.heuristicFreshness(true)
+}
+
+func (r *Resource) heuristicFreshness(shared bool) time.Duration {
+	if !r.hasExplicitExpiration(shared) && r.header.Get("Last-Modified") != "" {
 		return Clock().Sub(r.LastModified()) / time.Duration(lastModDivisor)
 	}
 
