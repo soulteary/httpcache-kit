@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 )
 
@@ -86,12 +88,7 @@ func (h *Handler) invalidationKeys(res *Resource, r *cacheRequest) []string {
 			if u := r.sameOriginURL(raw); u != nil {
 				copy := r.Clone(r.Context())
 				copy.URL = u
-				// Preserve server request-target form and exact escaping for
-				// policies that use RequestURI instead of URL. Client-style
-				// requests keep their empty RequestURI, as direct requests do.
-				if copy.RequestURI != "" {
-					copy.RequestURI = u.String()
-				}
+				copy.RequestURI = invalidationRequestURI(r.RequestURI, u)
 				if u.Host != "" {
 					copy.Host = u.Host
 				}
@@ -112,4 +109,17 @@ func (h *Handler) invalidationKeys(res *Resource, r *cacheRequest) []string {
 		keys = append(keys, key.String(), key.ForMethod(http.MethodHead).String())
 	}
 	return keys
+}
+
+// Proxy handlers can have an absolute URL and an origin-form RequestURI.
+// Keep the original request-target form rather than inferring it from URL.
+func invalidationRequestURI(original string, target *url.URL) string {
+	switch {
+	case original == "":
+		return ""
+	case strings.HasPrefix(original, "/") || original == "*":
+		return target.RequestURI()
+	default:
+		return target.String()
+	}
 }
