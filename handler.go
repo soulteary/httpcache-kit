@@ -356,8 +356,6 @@ func (h *Handler) validateCachedResponse(rw http.ResponseWriter, cReq *cacheRequ
 		// A changed Vary field set also needs a full Store to rebuild both the
 		// base discovery entry and the variant key. Keep old keys stale even
 		// if that refetch fails, rather than refreshing the old selection rule.
-		h.recordStale(keys...)
-		h.cache.Invalidate(keys...)
 		if varyChanged {
 			h.refetchChangedVaryResponse(rw, cReq, res)
 		} else {
@@ -401,22 +399,38 @@ func (cReq *cacheRequest) validationKeys() []string {
 
 func (h *Handler) refetchCachedResponse(rw http.ResponseWriter, cReq *cacheRequest, res *Resource) {
 	_ = res.Close()
+	h.refetchOriginalResponse(rw, cReq)
+}
+
+func (h *Handler) fenceValidationKeys(cReq *cacheRequest) {
 	keys := cReq.validationKeys()
 	h.recordStale(keys...)
 	h.cache.Invalidate(keys...)
+}
+
+func (h *Handler) refetchOriginalResponse(rw http.ResponseWriter, cReq *cacheRequest) {
+	h.fenceValidationKeys(cReq)
 	refetch := *cReq
 	refetch.Time = Clock()
 	h.passUpstream(rw, &refetch, nil)
 }
 
 func (h *Handler) refetchChangedVaryResponse(rw http.ResponseWriter, cReq *cacheRequest, res *Resource) {
-	if varyUsesClientValidators(combinedHeaderValues(res.Header(), "Vary")) {
+	vary := combinedHeaderValues(res.Header(), "Vary")
+	_ = res.Close()
+	h.refetchVaryResponse(rw, cReq, vary)
+}
+
+// refetchVaryResponse leaves closing the selected Resource to its caller.
+// Full validation responses supply the replacement policy, not the old one.
+func (h *Handler) refetchVaryResponse(rw http.ResponseWriter, cReq *cacheRequest, vary string) {
+	if varyUsesClientValidators(vary) {
 		// Removing a varied condition changes which representation the origin
 		// selects. Preserve it, even when a 304 leaves no body to rebuild with.
-		h.refetchCachedResponse(rw, cReq, res)
+		h.refetchOriginalResponse(rw, cReq)
 		return
 	}
-	_ = res.Close()
+	h.fenceValidationKeys(cReq)
 	// Rebuilding the index needs a body even when the client's validators
 	// match. Preserve other preconditions and Range at the origin, while the
 	// delivery writer applies the original matching conditions to the client.

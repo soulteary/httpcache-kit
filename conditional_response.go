@@ -79,15 +79,20 @@ func (h *Handler) validateUpstreamResponse(w http.ResponseWriter, req *cacheRequ
 		_ = exchange.reader.Close()
 		return false, false
 	}
-	if h.fullResponseVaryChanged(&validation, exchange.status, res.Header(), exchange.snapshot) ||
-		varyChangedClientValidators(combinedHeaderValues(exchange.snapshot, "Vary"), req.Request, out) {
-		// A changed selection policy needs the discovery key fenced too, and a
-		// rewritten selecting validator can produce another representation.
-		// The ordinary refetch fences all validation keys before taking a new
-		// fetch-start timestamp. Reusing this exchange with a later timestamp
-		// would make a response already in flight during a mutation appear newer.
+	if varyChangedClientValidators(combinedHeaderValues(exchange.snapshot, "Vary"), req.Request, out) {
+		// A rewritten selecting validator can produce another representation.
+		// Preserve the original request when retrying that selection.
 		_ = exchange.reader.Close()
 		return false, false
+	}
+	if h.fullResponseVaryChanged(&validation, exchange.status, res.Header(), exchange.snapshot) {
+		// Rebuild with a complete body even if the client's condition matches
+		// the replacement. Use its new Vary policy to decide which conditions
+		// can be removed, and apply the original conditions only to delivery.
+		// The rebuild fences all old keys before starting a genuine new fetch.
+		_ = exchange.reader.Close()
+		h.refetchVaryResponse(w, req, combinedHeaderValues(exchange.snapshot, "Vary"))
+		return false, true
 	}
 	client := newClientPreconditionWriter(w, req.Request)
 	copied := make(chan bool, 1)
