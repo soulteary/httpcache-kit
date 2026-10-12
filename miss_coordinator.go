@@ -65,6 +65,9 @@ func (h *Handler) leadMiss(w http.ResponseWriter, r *cacheRequest, complete func
 	}
 	if err := lease.Context().Err(); err != nil {
 		done()
+		if r.Context().Err() == nil {
+			http.Error(w, "cache fill coordination unavailable", http.StatusServiceUnavailable)
+		}
 		return nil, false
 	}
 	copy := *r
@@ -83,6 +86,15 @@ func (h *Handler) invalidationKeys(res *Resource, r *cacheRequest) []string {
 			if u := r.sameOriginURL(raw); u != nil {
 				copy := r.Clone(r.Context())
 				copy.URL = u
+				// Preserve server request-target form and exact escaping for
+				// policies that use RequestURI instead of URL. Client-style
+				// requests keep their empty RequestURI, as direct requests do.
+				if copy.RequestURI != "" {
+					copy.RequestURI = u.String()
+				}
+				if u.Host != "" {
+					copy.Host = u.Host
+				}
 				requests = append(requests, copy)
 			}
 		}
