@@ -115,7 +115,10 @@ type Handler struct {
 	// third-party Cache. Such a cache may return Resources without SetStoredAt,
 	// leaving only second-granular HTTP dates; a validation in the same second
 	// as a mutation would otherwise remain stale for the marker's lifetime.
-	localFresh map[string]time.Time
+	localFresh map[string]*localFreshProof
+	// localPublications bind fallback freshness evidence to
+	// a stable retrieval, even when an opaque backend completes writes late.
+	localPublications map[string]*localPublication
 	// localStaleTTL is how long those markers are kept; see
 	// HandlerOptions.StaleMarkerTTL.
 	localStaleTTL time.Duration
@@ -446,7 +449,7 @@ func (h *Handler) refetchChangedVaryResponse(rw http.ResponseWriter, cReq *cache
 }
 
 func (h *Handler) freshenValidatedResponse(res *Resource, keys []string) bool {
-	if err := h.cache.Freshen(res, keys...); err != nil {
+	if err := h.freshenResource(res, keys...); err != nil {
 		// The validation may have raced a newer invalidation, or the cache may
 		// have failed to persist it. Fetch the current representation in full.
 		h.debugf("freshening cached response failed: %v", err)
@@ -464,7 +467,6 @@ func (h *Handler) freshenValidatedResponse(res *Resource, keys []string) bool {
 	}
 	// Validator records when the conditional request began. cReq.Time predates
 	// lookup and can precede a mutation even if validation itself began after it.
-	h.recordFresh(res.RequestTime, keys...)
 	// Freshen advances the persisted generation, but cannot clear lookup's
 	// stale flag on this Resource. Clear it only after the ordered update so a
 	// successfully validated response does not carry Warning: 110.
@@ -509,6 +511,11 @@ func (h *Handler) freshness(res *Resource, r *cacheRequest) (time.Duration, erro
 }
 
 func (h *Handler) needsValidation(res *Resource, r *cacheRequest) bool {
+	// An explicit invalidation withdraws this representation. max-stale can
+	// relax natural expiration, but cannot make an invalidated body reusable.
+	if res.IsStale() {
+		return true
+	}
 	freshness, err := h.freshness(res, r)
 	if err != nil {
 		h.debugf("error calculating freshness: %s", err.Error())
@@ -603,9 +610,10 @@ func (h *Handler) pipeUpstream(w http.ResponseWriter, r *cacheRequest) {
 	}
 
 	res := rw.Resource()
+	res.RequestTime = r.Time
 	defer func() { _ = res.Close() }()
 
-	_ = h.cache.Freshen(res, r.Key.ForMethod("GET").String())
+	_ = h.freshenResource(res, r.Key.ForMethod("GET").String())
 }
 
 // passUpstream makes the request via the upstream handler and stores the result
@@ -625,6 +633,7 @@ func (h *Handler) passUpstreamWithHandler(w http.ResponseWriter, r *cacheRequest
 	}
 	if h.stagingBudget != nil {
 		rw.deferHeaders = true
+		rw.retainHeader = true
 		if deferred, ok := w.(interface {
 			DeferStagingHeaders()
 			FinishStagingHeaders()
@@ -951,42 +960,12 @@ func (h *Handler) recordStale(keys ...string) {
 		}
 	}
 	for key, at := range h.localFresh {
-		if at.Before(cutoff) {
+		if at.at.Before(cutoff) {
 			delete(h.localFresh, key)
 		}
 	}
 	for _, key := range keys {
 		h.localStale[key] = now
-	}
-}
-
-// recordFresh notes the precise generation represented by keys when the
-// Cache cannot expose one itself. at is the start of the upstream fetch or
-// validation, rather than its completion, so an operation already in flight
-// when a mutation occurs cannot make older content appear newer.
-func (h *Handler) recordFresh(at time.Time, keys ...string) {
-	if _, ok := h.cache.(staleAtChecker); ok {
-		return
-	}
-	if at.IsZero() {
-		at = Clock()
-	}
-
-	cutoff := Clock().Add(-h.staleMarkerTTL())
-	h.localStaleMu.Lock()
-	defer h.localStaleMu.Unlock()
-	if h.localFresh == nil {
-		h.localFresh = make(map[string]time.Time)
-	}
-	for key, recordedAt := range h.localFresh {
-		if recordedAt.Before(cutoff) {
-			delete(h.localFresh, key)
-		}
-	}
-	for _, key := range keys {
-		if previous, ok := h.localFresh[key]; !ok || at.After(previous) {
-			h.localFresh[key] = at
-		}
 	}
 }
 
@@ -1000,7 +979,7 @@ func (h *Handler) locallyFreshAfter(key string, staleAt time.Time) bool {
 	h.localStaleMu.Lock()
 	defer h.localStaleMu.Unlock()
 	at, ok := h.localFresh[key]
-	return ok && at.After(staleAt)
+	return ok && at.at.After(staleAt)
 }
 
 // resourceFreshAfter uses the generation evidence owned by the component that
@@ -1012,7 +991,7 @@ func (h *Handler) resourceFreshAfter(res *Resource, key string, staleAt time.Tim
 	if _, ok := h.cache.(staleAtChecker); ok {
 		return res.StoredAfter(staleAt)
 	}
-	return h.locallyFreshAfter(key, staleAt)
+	return res.handlerStoredAt.After(staleAt)
 }
 
 // staleAt reports when key was invalidated, from whichever record exists.
@@ -1108,19 +1087,13 @@ func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func())
 			keys = append(keys, r.Key.Vary(vary, r.Request).String())
 		}
 
-		var err error
-		if contextual, ok := h.cache.(ContextStore); ok {
-			err = contextual.StoreContext(context.WithoutCancel(r.Context()), res, keys...)
-		} else {
-			err = h.cache.Store(res, keys...)
-		}
+		err := h.publishResource(context.WithoutCancel(r.Context()), res, r.Time, keys...)
 		if err != nil {
 			h.errorf("storing resources %#v failed with error: %s", keys, err.Error())
 			if h.metrics != nil {
 				h.metricsRef().RecordStoreOperation(false)
 			}
 		} else {
-			h.recordFresh(r.Time, keys...)
 			if h.metrics != nil {
 				h.metricsRef().RecordStoreOperation(true)
 			}
@@ -1189,6 +1162,7 @@ func (h *Handler) recheckMiss(req *cacheRequest) (*Resource, error) {
 }
 
 func (h *Handler) lookupUsing(req *cacheRequest, retrieve func(string) (*Resource, error)) (*Resource, error) {
+	retrieve = h.generationRetriever(retrieve)
 	// A miss retry can select a different base or Vary policy.
 	req.discoveryKey, req.servedKey = "", ""
 	res, lookupKey, err := h.lookupBaseUsing(req, retrieve)
@@ -1213,7 +1187,7 @@ func (h *Handler) lookupUsing(req *cacheRequest, retrieve func(string) (*Resourc
 
 // lookupBaseResource also applies the narrower GET-to-HEAD fallback policy.
 func (h *Handler) lookupBaseResource(req *cacheRequest) (*Resource, Key, error) {
-	return h.lookupBaseUsing(req, h.cache.Retrieve)
+	return h.lookupBaseUsing(req, h.generationRetriever(h.cache.Retrieve))
 }
 
 func (h *Handler) lookupBaseUsing(req *cacheRequest, retrieve func(string) (*Resource, error)) (*Resource, Key, error) {
@@ -1552,11 +1526,13 @@ type responseStreamer struct {
 	http.ResponseWriter
 	pipeReader *io.PipeReader
 	pipeWriter *io.PipeWriter
-	// deferHeaders keeps initial metadata private until invalidation or staging
-	// admission has completed. Header must therefore return bufferedHeader
-	// rather than exposing the wrapped writer's live header map.
+	// deferHeaders postpones the client commit until invalidation or staging
+	// admission has completed. State-changing responses use bufferedHeader.
 	deferHeaders   bool
 	bufferedHeader http.Header
+	// Budgeted GET responses keep one live Header map across WriteHeader so
+	// saved references and later Header calls update the same trailer values.
+	retainHeader bool
 	// responseHeader is the immutable header snapshot that was committed with
 	// StatusCode. It is published by closing C, so WaitHeaders observes both,
 	// even when the actual client commit is deliberately deferred.
@@ -1574,10 +1550,10 @@ type responseStreamer struct {
 }
 
 // Header implements http.ResponseWriter. Ordinary responses retain the
-// wrapped writer's behavior. Deferred responses use a private copy until their
-// invalidation or staging admission decision permits the client commit.
+// wrapped writer's behavior. State-changing responses use a private copy until
+// invalidation permits the client commit.
 func (rw *responseStreamer) Header() http.Header {
-	if !rw.deferHeaders || rw.committed.Load() {
+	if !rw.deferHeaders || rw.retainHeader || rw.committed.Load() {
 		return rw.ResponseWriter.Header()
 	}
 	if rw.bufferedHeader == nil {
@@ -1672,7 +1648,7 @@ func (rw *responseStreamer) commitStagingHeaders(req *http.Request, status strin
 // finishStaging is called only after the upstream has finished its writes and
 // trailer updates. The background Store must never write to ResponseWriter.
 func (rw *responseStreamer) finishStaging(status string) {
-	if rw.deferHeaders {
+	if rw.deferHeaders && !rw.retainHeader {
 		// An origin may retain the Header map it obtained before WriteHeader.
 		// Publish its trailers now that its goroutine no longer mutates that map.
 		copyValidationTrailers(rw.Header(), rw.bufferedHeader, rw.responseHeader)

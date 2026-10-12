@@ -106,10 +106,15 @@ type cacheEntry struct {
 	storedAt   time.Time
 	accessedAt time.Time
 	element    *list.Element // for LRU tracking
+	generation *cacheGeneration
 }
 
+// A nonzero-sized identity distinguishes successful publications even when
+// Clock returns equal or decreasing timestamps. It never enters disk records.
+type cacheGeneration struct{ _ byte }
+
 type cacheKeyWriter struct {
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	users int
 }
 
@@ -140,9 +145,10 @@ type cache struct {
 	// body with the other's header.
 	publishMu sync.RWMutex
 
-	// Only writers of the same key share a long-lived lock. Different keys
-	// remain streamable in parallel; the reference count bounds the lock map
-	// to keys with an active or waiting writer.
+	// Same-key writers and generic VFS readers share a long-lived lock.
+	// Different keys remain streamable in parallel, while native disk readers
+	// can still open the previous generation during staging. The reference
+	// count bounds the map to keys with an active or waiting reader/writer.
 	writerMu    sync.Mutex
 	writers     map[string]*cacheKeyWriter
 	directoryMu sync.Mutex
@@ -183,12 +189,15 @@ type Header struct {
 	StatusCode int
 }
 
-// NewVFSCache returns a cache backend off the provided VFS
+// NewVFSCache returns a cache backend off the provided VFS. Its open readers
+// must retain their contents when the same path is rewritten. For ordinary
+// OS files, use NewDiskCache, which preserves readers through atomic rename.
 func NewVFSCache(fs vfs.VFS) Cache {
 	return NewVFSCacheWithConfig(fs, nil)
 }
 
-// NewVFSCacheWithConfig returns a cache backend with custom configuration
+// NewVFSCacheWithConfig returns a cache backend with custom configuration.
+// Its VFS must provide the stable-reader semantics described by NewVFSCache.
 func NewVFSCacheWithConfig(fs vfs.VFS, config *CacheConfig) ExtendedCache {
 	return newVFSCacheWithConfig(fs, config, "")
 }
@@ -286,6 +295,7 @@ func (c *cache) scanExistingCache() error {
 			size:       info.Size(),
 			storedAt:   storedAt,
 			accessedAt: info.ModTime(),
+			generation: new(cacheGeneration),
 		}
 
 		// Check if corresponding header file exists and add its size
@@ -424,6 +434,14 @@ func (c *cache) mkdirAll(path string) error {
 }
 
 func (c *cache) lockKeyWriter(hashedKey string) func() {
+	return c.lockKey(hashedKey, false)
+}
+
+func (c *cache) lockKeyReader(hashedKey string) func() {
+	return c.lockKey(hashedKey, true)
+}
+
+func (c *cache) lockKey(hashedKey string, read bool) func() {
 	c.writerMu.Lock()
 	if c.writers == nil {
 		c.writers = make(map[string]*cacheKeyWriter)
@@ -435,9 +453,17 @@ func (c *cache) lockKeyWriter(hashedKey string) func() {
 	}
 	writer.users++
 	c.writerMu.Unlock()
-	writer.mu.Lock()
+	if read {
+		writer.mu.RLock()
+	} else {
+		writer.mu.Lock()
+	}
 	return func() {
-		writer.mu.Unlock()
+		if read {
+			writer.mu.RUnlock()
+		} else {
+			writer.mu.Unlock()
+		}
 		c.writerMu.Lock()
 		writer.users--
 		if writer.users == 0 {
@@ -594,11 +620,15 @@ func (c *cache) Header(key string) (Header, error) {
 }
 
 func (c *cache) header(key string) (Header, error) {
+	hashed := hashKey(key)
+	if c.diskRoot == "" {
+		unlock := c.lockKeyReader(hashed)
+		defer unlock()
+	}
 	c.cleanupMu.RLock()
 	defer c.cleanupMu.RUnlock()
 	c.publishMu.RLock()
 	defer c.publishMu.RUnlock()
-	hashed := hashKey(key)
 	h, _, meta, err := c.readHeaderRecord(headerPrefix+formatPrefix+hashed, key)
 	if err != nil || meta == nil {
 		return h, err
@@ -735,13 +765,10 @@ func (c *cache) StoreContext(ctx context.Context, res *Resource, keys ...string)
 		defer c.releaseReservation(prepared[i].hashedKey)
 	}
 
-	// Generic VFS backends cannot rename staged files. Hide their in-place
-	// multi-key writes from readers until either every key succeeds or every
-	// affected key is discarded. Native disk staging remains concurrent.
-	locked := c.diskRoot == "" && len(keys) > 1
-	if locked {
-		c.publishMu.Lock()
-	}
+	// Target writer locks hide generic VFS in-place writes from same-key
+	// readers. Publication only holds the global lock for commit or rollback,
+	// allowing unrelated keys to stream and reserve capacity concurrently.
+	locked := false
 	defer func() {
 		if locked {
 			c.publishMu.Unlock()
@@ -1018,6 +1045,14 @@ func (c *cache) retrieveRecorded(key string, record bool) (*Resource, error) {
 }
 
 func (c *cache) retrieve(key string, record bool) (*Resource, error) {
+	hashedKey := hashKey(key)
+	// Generic VFS publication rewrites live files, so same-key readers wait
+	// for the complete writer transaction. Acquire this before publishMu to
+	// avoid blocking a writer's commit while waiting for its key lock.
+	if c.diskRoot == "" {
+		unlock := c.lockKeyReader(hashedKey)
+		defer unlock()
+	}
 	// Cleanup removes an expired entry and its invalidation marker as one
 	// generation transition. Holding the read side from file open through the
 	// marker check means a retrieval either observes the old file WITH its
@@ -1033,8 +1068,8 @@ func (c *cache) retrieve(key string, record bool) (*Resource, error) {
 	c.publishMu.RLock()
 	defer c.publishMu.RUnlock()
 
-	hashedKey := hashKey(key)
 	bodyPath := bodyPrefix + formatPrefix + hashedKey
+	storedGeneration := c.entryGeneration(hashedKey)
 	f, err := c.fs.Open(bodyPath)
 	if err != nil {
 		if vfs.IsNotExist(err) {
@@ -1068,6 +1103,7 @@ func (c *cache) retrieve(key string, record bool) (*Resource, error) {
 	}
 	res.SetStoredAt(persistedAt)
 	res.storedKey = key
+	res.storageGeneration = storedGeneration
 
 	// Check stale map with proper locking
 	c.staleMutex.RLock()
@@ -1386,9 +1422,9 @@ func (c *cache) freshenResourceForKey(res *Resource, key string) (bool, error) {
 	}
 	// A Resource retrieved before a replacement cannot refresh that newer
 	// generation even if its weak validators or content length still match.
-	// Base Vary entries can precede the retrieved variant, so only a newer
-	// target supersedes it. Freshly fetched HEAD resources have no storedAt.
-	if !res.storedAt.IsZero() && storedAt.After(res.storedAt) {
+	// Freshly fetched HEAD resources have no stored generation. Legacy
+	// resources retain the timestamp fallback for compatibility.
+	if c.resourceWasReplaced(res, hashedKey, storedAt) {
 		return false, fmt.Errorf("freshening target %q was replaced after retrieval", key)
 	}
 	if h.StatusCode != res.Status() || !headersEqual(h.Header, res.Header()) {
@@ -1411,14 +1447,31 @@ func (c *cache) freshenResourceForKey(res *Resource, key string) (bool, error) {
 	if err := c.reserveEntry(hashedKey, newSize); err != nil {
 		return false, fmt.Errorf("failed to admit freshening target %q: %w", key, err)
 	}
-	return false, c.commitFreshenedHeader(key, hashedKey, headerData, newSize, freshenedAt)
+	if err := c.commitFreshenedHeader(key, hashedKey, headerData, newSize, freshenedAt); err != nil {
+		return false, err
+	}
+	if res.storageGeneration != nil {
+		res.storageGeneration = c.entryGeneration(hashedKey)
+	}
+	return false, nil
+}
+
+func (c *cache) resourceWasReplaced(res *Resource, hashedKey string, storedAt time.Time) bool {
+	if res.storageGeneration != nil {
+		return res.storageGeneration != c.entryGeneration(hashedKey)
+	}
+	return !res.storedAt.IsZero() && storedAt.After(res.storedAt)
 }
 
 // Called while the key writer lock and capacity reservation remain held.
 func (c *cache) commitFreshenedHeader(key, hashedKey string, headerData []byte, newSize int64, freshenedAt time.Time) error {
+	// The key writer lock hides generic VFS header replacement from readers.
+	// Native disk readers can continue using the old header during staging.
 	header, _, err := c.stageSerializedHeader(headerData, key)
+	c.publishMu.Lock()
+	defer c.publishMu.Unlock()
 	if err == nil {
-		err = c.commitStaged(header)
+		err = c.commitStagedLocked(header)
 	}
 	if err != nil {
 		c.abandonStaged(header)
@@ -1527,6 +1580,7 @@ func (c *cache) trackEntry(key, hashedKey string, size int64, storedAt time.Time
 		entry.size = size
 		entry.storedAt = storedAt
 		entry.accessedAt = storedAt
+		entry.generation = new(cacheGeneration)
 		c.totalSize += size
 		// Move to front of LRU list
 		c.lruList.MoveToFront(entry.element)
@@ -1538,11 +1592,21 @@ func (c *cache) trackEntry(key, hashedKey string, size int64, storedAt time.Time
 			size:       size,
 			storedAt:   storedAt,
 			accessedAt: storedAt,
+			generation: new(cacheGeneration),
 		}
 		entry.element = c.lruList.PushFront(entry)
 		c.lruIndex[hashedKey] = entry
 		c.totalSize += size
 	}
+}
+
+func (c *cache) entryGeneration(hashedKey string) *cacheGeneration {
+	c.lruMutex.RLock()
+	defer c.lruMutex.RUnlock()
+	if entry := c.lruIndex[hashedKey]; entry != nil {
+		return entry.generation
+	}
+	return nil
 }
 
 // entryStoredAt reports when this cache last WROTE the entry, at full

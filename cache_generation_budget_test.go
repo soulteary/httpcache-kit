@@ -200,29 +200,38 @@ func TestCacheParallelStoresReserveCapacity(t *testing.T) {
 }
 
 func TestCacheDifferentKeysStreamConcurrently(t *testing.T) {
-	c := generationBudgetCache(t, true, 10000)
-	started, release := make(chan struct{}, 2), make(chan struct{})
-	done := make(chan error, 2)
-	for _, key := range []string{"first", "second"} {
-		res := NewResource(200, &generationBudgetBody{reader: bytes.NewReader(bytes.Repeat([]byte("x"), 1200)), started: started, release: release}, http.Header{"Content-Length": {"1200"}})
-		go func() { done <- c.Store(res, key) }()
-	}
-	concurrent := true
-	for i := 0; i < 2; i++ {
-		select {
-		case <-started:
-		case <-time.After(time.Second):
-			concurrent = false
-		}
-	}
-	close(release)
-	for i := 0; i < 2; i++ {
-		if err := <-done; err != nil {
-			t.Fatal(err)
-		}
-	}
-	if !concurrent {
-		t.Fatal("different keys serialized their body streams")
+	for _, disk := range []bool{false, true} {
+		t.Run(stringBool(disk), func(t *testing.T) {
+			c := generationBudgetCache(t, disk, 10000)
+			started, release := make(chan struct{}, 2), make(chan struct{})
+			done := make(chan error, 2)
+			for _, key := range []string{"first", "second"} {
+				res := NewResource(200, &generationBudgetBody{reader: bytes.NewReader(bytes.Repeat([]byte("x"), 1200)), started: started, release: release}, http.Header{"Content-Length": {"1200"}})
+				go func() { done <- c.Store(res, key) }()
+			}
+			concurrent := true
+			for i := 0; i < 2; i++ {
+				select {
+				case <-started:
+				case <-time.After(time.Second):
+					concurrent = false
+				}
+			}
+			close(release)
+			for i := 0; i < 2; i++ {
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("released stream did not complete")
+				}
+			}
+			if !concurrent {
+				t.Fatal("different keys serialized their body streams")
+			}
+		})
 	}
 }
 

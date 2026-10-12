@@ -249,6 +249,12 @@ A custom VFS must account for its own buffers. `StoreContext` cooperatively
 checks cancellation between reads/writes; it cannot interrupt an arbitrary
 blocking Reader or VFS call.
 
+`NewVFSCache` requires open readers to retain their contents when the same
+path is rewritten. The memory backend provides this behavior. For ordinary
+OS files, use `NewDiskCache`: its atomic rename preserves already-open readers.
+Generic VFS publication serializes opening readers with same-key writes;
+it cannot provide immutable snapshots for custom mutable file handles.
+
 With a handler staging budget, admission refused before streaming is reported
 in the initial `X-Cache: SKIP` header. An admitted HTTP/1.1 or HTTP/2 response
 with a body declares the `X-Cache-Staging` trailer: read the complete body to

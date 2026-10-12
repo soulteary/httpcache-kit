@@ -161,23 +161,23 @@ func TestLegacyStaleSnapshotReadsBaseLast(t *testing.T) {
 	}
 }
 
-func TestHandlerFreshGenerationPreservesNewerRecordAndPrunesExpired(t *testing.T) {
+func TestHandlerFreshGenerationRecordsLatestPublicationAndPrunesExpired(t *testing.T) {
 	c := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0))
 	t.Cleanup(func() { _ = c.Close() })
 	h := NewHandler(plainCache{inner: c}, nil)
 	now := Clock()
-	h.localFresh = map[string]time.Time{
-		"expired": now.Add(-2 * defaultStaleMarkerTTL),
-		"newer":   now.Add(time.Hour),
+	h.localFresh = map[string]*localFreshProof{
+		"expired": {at: now.Add(-2 * defaultStaleMarkerTTL)},
+		"newer":   {at: now.Add(time.Hour)},
 	}
-	h.recordFresh(time.Time{}, "new", "newer")
+	h.beginLocalPublication(time.Time{}, []string{"new", "newer"})(true)
 	if _, present := h.localFresh["expired"]; present {
 		t.Fatal("expired freshness record retained")
 	}
-	if !h.localFresh["newer"].Equal(now.Add(time.Hour)) || h.localFresh["new"].Before(now) {
+	if h.localFresh["newer"].at.Before(now) || h.localFresh["newer"].at.After(Clock()) || h.localFresh["new"].at.Before(now) {
 		t.Fatalf("freshness records=%v", h.localFresh)
 	}
-	h.localFresh["expired"] = now.Add(-2 * defaultStaleMarkerTTL)
+	h.localFresh["expired"] = &localFreshProof{at: now.Add(-2 * defaultStaleMarkerTTL)}
 	h.recordStale("new")
 	if _, present := h.localFresh["expired"]; present {
 		t.Fatal("invalidation retained an expired freshness record")
