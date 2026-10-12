@@ -16,7 +16,20 @@ const (
 type CacheControl map[string][]string
 
 func ParseCacheControlHeaders(h http.Header) (CacheControl, error) {
-	return ParseCacheControl(strings.Join(h["Cache-Control"], ", "))
+	// HTTP field names are case-insensitive, including headers constructed
+	// directly by an embedding application rather than net/http.
+	var names []string
+	for name := range h {
+		if strings.EqualFold(name, CacheControlHeader) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	var values []string
+	for _, name := range names {
+		values = append(values, h[name]...)
+	}
+	return ParseCacheControl(strings.Join(values, ", "))
 }
 
 func ParseCacheControl(input string) (CacheControl, error) {
@@ -61,7 +74,8 @@ func ParseCacheControl(input string) (CacheControl, error) {
 }
 
 func (cc CacheControl) Get(key string) (string, bool) {
-	v, exists := cc[key]
+	storedKey, exists := cc.lookupKey(key)
+	v := cc[storedKey]
 	if exists && len(v) > 0 {
 		return v[0], true
 	}
@@ -69,7 +83,12 @@ func (cc CacheControl) Get(key string) (string, bool) {
 }
 
 func (cc CacheControl) Add(key, val string) {
-	if !cc.Has(key) {
+	if storedKey, exists := cc.lookupKey(key); exists {
+		// Preserve the spelling of entries constructed through the exported
+		// map type, rather than creating a second directive under a new key.
+		key = storedKey
+	} else {
+		key = strings.ToLower(key)
 		cc[key] = []string{}
 	}
 	if val != "" {
@@ -78,8 +97,28 @@ func (cc CacheControl) Add(key, val string) {
 }
 
 func (cc CacheControl) Has(key string) bool {
-	_, exists := cc[key]
+	_, exists := cc.lookupKey(key)
 	return exists
+}
+
+// Parsed directives use lowercase keys, but callers may also build this
+// exported map directly. Keep the common lookup fast and recognize existing
+// mixed-case entries without mutating the map during reads.
+func (cc CacheControl) lookupKey(key string) (string, bool) {
+	lower := strings.ToLower(key)
+	if _, exists := cc[lower]; exists {
+		return lower, true
+	}
+	if _, exists := cc[key]; exists {
+		return key, true
+	}
+	var found string
+	for candidate := range cc {
+		if strings.EqualFold(candidate, key) && (found == "" || candidate < found) {
+			found = candidate
+		}
+	}
+	return found, found != ""
 }
 
 func (cc CacheControl) Duration(key string) (time.Duration, error) {

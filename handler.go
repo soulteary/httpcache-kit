@@ -277,6 +277,22 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			if cReq.servedKey != "" && cReq.servedKey != keys[0] {
 				keys = append(keys, cReq.servedKey)
 			}
+			if !h.isCacheable(res, cReq) {
+				// A 304 can withdraw permission to reuse the stored response.
+				// Do not freshen a formerly public object after no-store/private
+				// metadata arrives, or leave the old policy available to later hits.
+				h.recordStale(keys...)
+				h.cache.Invalidate(keys...)
+				_ = res.Close()
+				h.passUpstream(rw, cReq, nil)
+				return
+			}
+			if h.Shared {
+				// Apply field-qualified private directives introduced by the 304
+				// before persisting or serving its merged metadata, just as Store
+				// does for a newly fetched representation.
+				res.RemovePrivateHeaders()
+			}
 			if err := h.cache.Freshen(res, keys...); err != nil {
 				// The validation may have raced a newer invalidation, or the
 				// cache may have failed to persist it. Serving the old body as a
@@ -358,7 +374,7 @@ func (h *Handler) freshness(res *Resource, r *cacheRequest) (time.Duration, erro
 		return time.Duration(0), nil
 	}
 
-	if hFresh := res.HeuristicFreshness(); hFresh > maxAge {
+	if hFresh := res.heuristicFreshness(h.Shared); hFresh > maxAge {
 		h.debugf("using heuristic freshness of %q", hFresh)
 		maxAge = hFresh
 	}
@@ -690,8 +706,12 @@ func (h *Handler) isCacheable(res *Resource, r *cacheRequest) bool {
 		return false
 	}
 
-	if res.HasExplicitExpiration() {
-		return true
+	if res.hasExplicitExpiration(h.Shared) {
+		maxAge, err := res.MaxAge(h.Shared)
+		// Retain immediately stale entries only when a later request can
+		// validate them. Zero still suppresses heuristic freshness and must
+		// never fall back to Expires or a less restrictive shared lifetime.
+		return err == nil && (maxAge > 0 || res.HasValidators())
 	}
 
 	if _, ok := cacheableByDefault[res.Status()]; !ok && !cc.Has("public") {
@@ -700,7 +720,7 @@ func (h *Handler) isCacheable(res *Resource, r *cacheRequest) bool {
 
 	if res.HasValidators() {
 		return true
-	} else if res.HeuristicFreshness() > 0 {
+	} else if res.heuristicFreshness(h.Shared) > 0 {
 		return true
 	}
 
@@ -722,7 +742,7 @@ func (h *Handler) serveResource(res *Resource, w http.ResponseWriter, req *cache
 	}
 
 	// http://httpwg.github.io/specs/rfc7234.html#warn.113
-	if age > (time.Hour*24) && res.HeuristicFreshness() > (time.Hour*24) {
+	if age > (time.Hour*24) && res.heuristicFreshness(h.Shared) > (time.Hour*24) {
 		w.Header().Add("Warning", `113 - "Heuristic Expiration"`)
 	}
 
@@ -1016,7 +1036,7 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 			return nil, err
 		}
 
-		if res.HasExplicitExpiration() && req.isCacheable() {
+		if res.hasExplicitExpiration(h.Shared) && req.isCacheable() {
 			h.debugf("using cached GET request for serving HEAD")
 			req.servedKey = baseKey
 		} else {
@@ -1111,7 +1131,7 @@ type cacheRequest struct {
 }
 
 func newCacheRequest(r *http.Request) (*cacheRequest, error) {
-	cc, err := ParseCacheControl(r.Header.Get("Cache-Control"))
+	cc, err := ParseCacheControlHeaders(r.Header)
 	if err != nil {
 		return nil, err
 	}

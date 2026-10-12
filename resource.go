@@ -231,19 +231,11 @@ func (r *Resource) MaxAge(shared bool) (time.Duration, error) {
 	}
 
 	if cc.Has("s-maxage") && shared {
-		if maxAge, err := cc.Duration("s-maxage"); err != nil {
-			return time.Duration(0), err
-		} else if maxAge > 0 {
-			return maxAge, nil
-		}
+		return cc.Duration("s-maxage")
 	}
 
 	if cc.Has("max-age") {
-		if maxAge, err := cc.Duration("max-age"); err != nil {
-			return time.Duration(0), err
-		} else if maxAge > 0 {
-			return maxAge, nil
-		}
+		return cc.Duration("max-age")
 	}
 
 	if expiresVal := r.header.Get("Expires"); expiresVal != "" {
@@ -278,17 +270,23 @@ func (r *Resource) HasValidators() bool {
 }
 
 func (r *Resource) HasExplicitExpiration() bool {
+	return r.hasExplicitExpiration(true)
+}
+
+// s-maxage applies only to shared caches. Keep the public metadata predicate
+// unchanged while the handler evaluates expiration using its own profile.
+func (r *Resource) hasExplicitExpiration(shared bool) bool {
 	cc, err := r.cacheControl()
 	if err != nil {
 		debugf("Error parsing Cache-Control: %s", err.Error())
 		return false
 	}
 
-	if d, _ := cc.Duration("max-age"); d > time.Duration(0) {
+	if cc.Has("max-age") {
 		return true
 	}
 
-	if d, _ := cc.Duration("s-maxage"); d > time.Duration(0) {
+	if shared && cc.Has("s-maxage") {
 		return true
 	}
 
@@ -300,7 +298,11 @@ func (r *Resource) HasExplicitExpiration() bool {
 }
 
 func (r *Resource) HeuristicFreshness() time.Duration {
-	if !r.HasExplicitExpiration() && r.header.Get("Last-Modified") != "" {
+	return r.heuristicFreshness(true)
+}
+
+func (r *Resource) heuristicFreshness(shared bool) time.Duration {
+	if !r.hasExplicitExpiration(shared) && r.header.Get("Last-Modified") != "" {
 		return Clock().Sub(r.LastModified()) / time.Duration(lastModDivisor)
 	}
 

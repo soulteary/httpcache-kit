@@ -993,11 +993,15 @@ func TestThirdPartyVariantValidationUsesPreciseHandlerTime(t *testing.T) {
 	Clock = func() time.Time { return now }
 
 	var upstreamHits int32
-	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&upstreamHits, 1)
 		w.Header().Set("Cache-Control", "max-age=3600")
 		w.Header().Set("Vary", "Accept-Language")
 		w.Header().Set("ETag", `"v1"`)
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("body"))
 	})
