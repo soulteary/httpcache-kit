@@ -402,7 +402,7 @@ func (c *cache) abandonStaged(entries ...*stagedEntry) {
 }
 
 // anyPublished reports whether a failed store already changed something on
-// disk, which is only possible on a backend that writes in place.
+// disk, either through an in-place write or a partially completed commit.
 func anyPublished(entries ...*stagedEntry) bool {
 	for _, e := range entries {
 		if e != nil && e.published {
@@ -606,106 +606,131 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 	c.generationMu.RLock()
 	defer c.generationMu.RUnlock()
 
-	// A multi-key store is all-or-nothing with respect to invalidation. Vary
-	// responses contain the governing base key followed by a variant key. If
-	// the base marker supersedes the response, continuing to the unmarked
-	// variant publishes the same pre-mutation body under that second key.
+	if c.responseSuperseded(res, keys) {
+		return nil
+	}
+
+	expectedSize, hasExpectedSize := expectedBodySize(res.Header())
+	for _, key := range keys {
+		if err := c.storeResourceForKey(res, key, expectedSize, hasExpectedSize); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// responseSuperseded checks every governing key before any entry is changed.
+// A multi-key store is all-or-nothing with respect to invalidation. Vary
+// responses contain the governing base key followed by a variant key. If
+// the base marker supersedes the response, continuing to the unmarked
+// variant publishes the same pre-mutation body under that second key.
+// The caller must hold generationMu throughout this check and every write.
+func (c *cache) responseSuperseded(res *Resource, keys []string) bool {
 	for _, key := range keys {
 		if staleTime, marked := c.StaleAt(key); marked && !res.ReceivedAfter(staleTime) {
 			debugf("not storing %q: response superseded by the invalidation at %s", keys, staleTime)
-			return nil
+			return true
+		}
+	}
+	return false
+}
+
+func expectedBodySize(h http.Header) (int64, bool) {
+	length, err := strconv.ParseInt(h.Get("Content-Length"), 10, 64)
+	if err != nil || length < 0 {
+		return 0, false
+	}
+	return length, true
+}
+
+// storeResourceForKey stages, admits, and publishes one entry. The caller
+// holds generationMu so invalidation cannot finalize between these steps.
+func (c *cache) storeResourceForKey(res *Resource, key string, expectedSize int64, hasExpectedSize bool) error {
+	if _, err := res.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to rewind resource for key %q: %w", key, err)
+	}
+
+	// The stale marker is deliberately LEFT IN PLACE.
+	//
+	// Retrieve already compares a stored response's Date against the
+	// marker, so a response written after the invalidation supersedes it
+	// without the marker having to be deleted. Deleting it here was
+	// actively wrong twice over: a store that was already in flight when a
+	// mutation completed erased the newer invalidation and republished the
+	// pre-mutation response as fresh, and refetching ONE Vary variant
+	// cleared the base marker that every OTHER variant is still judged
+	// against. The cleanup goroutine expires markers on its own.
+	hashedKey := hashKey(key)
+	storedAt := Clock()
+	headerData, err := serializeStoredHeader(res.Status(), res.Header(), storedAt)
+	if err != nil {
+		return fmt.Errorf("failed to serialize headers for key %q: %w", key, err)
+	}
+
+	// If Content-Length is known, make room before the write. Unknown-length
+	// streams are accounted for and evicted immediately after the write. The
+	// persisted header is part of the admission size too; excluding it lets
+	// otherwise equal replacements drift beyond MaxSize.
+	if hasExpectedSize {
+		if err := c.evictIfNeeded(hashedKey, expectedSize+int64(len(headerData))); err != nil {
+			return fmt.Errorf("failed to make room for key %q: %w", key, err)
 		}
 	}
 
-	expectedSize, hasExpectedSize := int64(0), false
-	if rawLength := res.Header().Get("Content-Length"); rawLength != "" {
-		length, err := strconv.ParseInt(rawLength, 10, 64)
-		if err == nil && length >= 0 {
-			expectedSize, hasExpectedSize = length, true
+	var body io.Reader = res
+	if hasExpectedSize {
+		body = io.LimitReader(res, expectedSize)
+	}
+	// Body and header are written first and published together further
+	// down. Until that commit the entry already on disk is untouched, so
+	// every failure here just drops the staged files. On a backend that
+	// writes in place there is nothing to stage, and the existing discard
+	// path still applies -- anyPublished says which case this is.
+	bodyStaged, written, err := c.stageBody(body, key)
+	fail := func(err error) error {
+		return c.discardFailedStore(err, key, hashedKey, bodyStaged, written+int64(len(headerData)), storedAt)
+	}
+	if err != nil {
+		return fail(err)
+	}
+	if hasExpectedSize && written != expectedSize {
+		return fail(fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize))
+	}
+	if !hasExpectedSize {
+		if err := c.evictIfNeeded(hashedKey, written+int64(len(headerData))); err != nil {
+			return fail(fmt.Errorf("failed to make room for key %q: %w", key, err))
 		}
 	}
 
-	for _, key := range keys {
-		if _, err := res.Seek(0, io.SeekStart); err != nil {
-			return fmt.Errorf("failed to rewind resource for key %q: %w", key, err)
-		}
-
-		// The stale marker is deliberately LEFT IN PLACE.
-		//
-		// Retrieve already compares a stored response's Date against the
-		// marker, so a response written after the invalidation supersedes it
-		// without the marker having to be deleted. Deleting it here was
-		// actively wrong twice over: a store that was already in flight when a
-		// mutation completed erased the newer invalidation and republished the
-		// pre-mutation response as fresh, and refetching ONE Vary variant
-		// cleared the base marker that every OTHER variant is still judged
-		// against. The cleanup goroutine expires markers on its own.
-		hashedKey := hashKey(key)
-		storedAt := Clock()
-		headerData, err := serializeStoredHeader(res.Status(), res.Header(), storedAt)
-		if err != nil {
-			return fmt.Errorf("failed to serialize headers for key %q: %w", key, err)
-		}
-
-		// If Content-Length is known, make room before the write. Unknown-length
-		// streams are accounted for and evicted immediately after the write. The
-		// persisted header is part of the admission size too; excluding it lets
-		// otherwise equal replacements drift beyond MaxSize.
-		if hasExpectedSize {
-			if err := c.evictIfNeeded(hashedKey, expectedSize+int64(len(headerData))); err != nil {
-				return fmt.Errorf("failed to make room for key %q: %w", key, err)
-			}
-		}
-
-		var body io.Reader = res
-		if hasExpectedSize {
-			body = io.LimitReader(res, expectedSize)
-		}
-		// Body and header are written first and published together further
-		// down. Until that commit the entry already on disk is untouched, so
-		// every failure here just drops the staged files. On a backend that
-		// writes in place there is nothing to stage, and the existing discard
-		// path still applies -- anyPublished says which case this is.
-		bodyStaged, written, err := c.stageBody(body, key)
-		fail := func(err error) error {
-			c.abandonStaged(bodyStaged)
-			if anyPublished(bodyStaged) {
-				if discardErr := c.discardUnadmitted(key, hashedKey, written+int64(len(headerData)), storedAt); discardErr != nil {
-					err = errors.Join(err, fmt.Errorf("discard entry after failed store for key %q: %w", key, discardErr))
-				}
-			}
-			return err
-		}
-		if err != nil {
-			return fail(err)
-		}
-		if hasExpectedSize && written != expectedSize {
-			return fail(fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize))
-		}
-		if !hasExpectedSize {
-			if err := c.evictIfNeeded(hashedKey, written+int64(len(headerData))); err != nil {
-				return fail(fmt.Errorf("failed to make room for key %q: %w", key, err))
-			}
-		}
-
-		headerStaged, headerBytes, err := c.stageSerializedHeader(headerData, key)
-		if err != nil {
-			c.abandonStaged(headerStaged)
-			return fail(err)
-		}
-
-		// One step, under publishMu: a reader sees the whole previous entry or
-		// the whole new one, never one version's body with the other's header.
-		if err := c.commitStaged(bodyStaged, headerStaged); err != nil {
-			c.abandonStaged(bodyStaged, headerStaged)
-			return fail(err)
-		}
-
-		// Update LRU tracking
-		c.trackEntry(key, hashedKey, written+headerBytes, storedAt)
+	headerStaged, headerBytes, err := c.stageSerializedHeader(headerData, key)
+	if err != nil {
+		c.abandonStaged(headerStaged)
+		return fail(err)
 	}
 
+	// One step, under publishMu: a reader sees the whole previous entry or
+	// the whole new one, never one version's body with the other's header.
+	if err := c.commitStaged(bodyStaged, headerStaged); err != nil {
+		c.abandonStaged(bodyStaged, headerStaged)
+		return fail(err)
+	}
+
+	// Update LRU tracking
+	c.trackEntry(key, hashedKey, written+headerBytes, storedAt)
 	return nil
+}
+
+// discardFailedStore preserves a previous entry if staging never published
+// anything. An in-place write or partially completed commit must instead
+// remove the changed entry, retaining its size for cleanup if removal fails.
+func (c *cache) discardFailedStore(err error, key, hashedKey string, body *stagedEntry, residualSize int64, storedAt time.Time) error {
+	c.abandonStaged(body)
+	if anyPublished(body) {
+		if discardErr := c.discardUnadmitted(key, hashedKey, residualSize, storedAt); discardErr != nil {
+			err = errors.Join(err, fmt.Errorf("discard entry after failed store for key %q: %w", key, discardErr))
+		}
+	}
+	return err
 }
 
 func (c *cache) stageBody(r io.Reader, key string) (*stagedEntry, int64, error) {

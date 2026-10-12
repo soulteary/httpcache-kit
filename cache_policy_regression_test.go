@@ -220,23 +220,28 @@ func TestRepositoryValidationOverHTTP(t *testing.T) {
 			}
 			request(false)
 			rec := request(true)
-			if status == 304 {
-				if rec.Code != 200 || rec.Body.String() != "old-index" || hits.Load() != 2 {
-					t.Fatalf("304 response: status=%d body=%q hits=%d", rec.Code, rec.Body.String(), hits.Load())
-				}
-				header, err := cache.Header("GET:http://cache.example/InRelease")
-				if err != nil {
-					t.Fatal(err)
-				}
-				if header.Get("Content-Length") != "9" || !strings.Contains(header.Get("Content-Type"), "text/plain") {
-					t.Fatalf("persisted metadata lost: %v", header)
-				}
-			} else {
-				if rec.Code != status || rec.Body.String() != "new-index" {
-					t.Fatalf("non-304 response: status=%d body=%q want status=%d/new-index", rec.Code, rec.Body.String(), status)
-				}
-			}
+			assertRepositoryValidationResponse(t, status, rec, hits.Load(), cache)
 		})
+	}
+}
+
+func assertRepositoryValidationResponse(t *testing.T, status int, rec *httptest.ResponseRecorder, hits int64, cache Cache) {
+	t.Helper()
+	if status != http.StatusNotModified {
+		if rec.Code != status || rec.Body.String() != "new-index" {
+			t.Fatalf("non-304 response: status=%d body=%q want status=%d/new-index", rec.Code, rec.Body.String(), status)
+		}
+		return
+	}
+	if rec.Code != http.StatusOK || rec.Body.String() != "old-index" || hits != 2 {
+		t.Fatalf("304 response: status=%d body=%q hits=%d", rec.Code, rec.Body.String(), hits)
+	}
+	header, err := cache.Header("GET:http://cache.example/InRelease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header.Get("Content-Length") != "9" || !strings.Contains(header.Get("Content-Type"), "text/plain") {
+		t.Fatalf("persisted metadata lost: %v", header)
 	}
 }
 
@@ -346,21 +351,7 @@ func TestValidator304CanonicalizesMetadataUpdates(t *testing.T) {
 func TestShared304MetadataPolicyAndPrivacy(t *testing.T) {
 	for _, backend := range []string{"memory", "disk"} {
 		t.Run(backend, func(t *testing.T) {
-			var cache ExtendedCache
-			if backend == "memory" {
-				cache = NewMemoryCache().(ExtendedCache)
-			} else {
-				var err error
-				cache, err = NewDiskCacheWithConfig(t.TempDir(), nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-			defer func() {
-				if err := cache.Close(); err != nil {
-					t.Error(err)
-				}
-			}()
+			cache := newRegressionTestCache(t, backend)
 			for _, privateField := range []bool{false, true} {
 				t.Run(stringBool(privateField), func(t *testing.T) {
 					var hits atomic.Int64
@@ -423,17 +414,7 @@ func TestExternallyConstructedCacheControlKeepsMixedCaseEntries(t *testing.T) {
 		t.Run(spelling, func(t *testing.T) {
 			cc := CacheControl{spelling: {"60"}, "No-Store": {}}
 			before := CacheControl{spelling: {"60"}, "No-Store": {}}
-			for _, query := range []string{"max-age", "MAX-AGE", "mAx-AgE"} {
-				if value, exists := cc.Get(query); !exists || value != "60" {
-					t.Fatalf("literal lookup %q: value=%q exists=%v", query, value, exists)
-				}
-				if !cc.Has(query) {
-					t.Fatalf("literal Has(%q) false", query)
-				}
-				if duration, err := cc.Duration(query); err != nil || duration != time.Minute {
-					t.Fatalf("literal Duration(%q)=%v err=%v", query, duration, err)
-				}
-			}
+			assertMixedCaseDirectiveLookups(t, cc)
 			if value, exists := cc.Get("NO-STORE"); !exists || value != "" {
 				t.Fatalf("mixed-case flag lookup: value=%q exists=%v", value, exists)
 			}
@@ -452,6 +433,41 @@ func TestExternallyConstructedCacheControlKeepsMixedCaseEntries(t *testing.T) {
 			}
 		})
 	}
+}
+
+func assertMixedCaseDirectiveLookups(t *testing.T, cc CacheControl) {
+	t.Helper()
+	for _, query := range []string{"max-age", "MAX-AGE", "mAx-AgE"} {
+		if value, exists := cc.Get(query); !exists || value != "60" {
+			t.Fatalf("literal lookup %q: value=%q exists=%v", query, value, exists)
+		}
+		if !cc.Has(query) {
+			t.Fatalf("literal Has(%q) false", query)
+		}
+		if duration, err := cc.Duration(query); err != nil || duration != time.Minute {
+			t.Fatalf("literal Duration(%q)=%v err=%v", query, duration, err)
+		}
+	}
+}
+
+func newRegressionTestCache(t *testing.T, backend string) ExtendedCache {
+	t.Helper()
+	var cache ExtendedCache
+	if backend == "memory" {
+		cache = NewMemoryCache().(ExtendedCache)
+	} else {
+		var err error
+		cache, err = NewDiskCacheWithConfig(t.TempDir(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		if err := cache.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return cache
 }
 
 func TestSMaxageOnlyUsesPrivateHeuristicFreshness(t *testing.T) {

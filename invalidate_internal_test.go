@@ -1427,11 +1427,7 @@ func TestValidationRefetchesWhenInvalidatedDuringFreshen(t *testing.T) {
 		h.ServeHTTP(rec, req)
 	}()
 
-	select {
-	case <-fs.entered:
-	case <-time.After(time.Second):
-		t.Fatal("Freshen did not reach the blocked header write")
-	}
+	waitForHandlerFlowEvent(t, fs.entered, "Freshen did not reach the blocked header write")
 	changed.Store(true)
 	invalidated := make(chan struct{})
 	go func() {
@@ -1439,30 +1435,12 @@ func TestValidationRefetchesWhenInvalidatedDuringFreshen(t *testing.T) {
 		close(invalidated)
 	}()
 
-	deadline := time.After(time.Second)
-	for {
-		if at, ok := c.StaleAt(key); ok && at.Equal(invalidationBarrierTime) {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatal("second invalidation did not publish its barrier")
-		case <-time.After(time.Millisecond):
-		}
-	}
+	waitForFreshenInvalidationBarrier(t, c, key)
 	close(fs.release)
 	released = true
 
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("request did not finish after releasing Freshen")
-	}
-	select {
-	case <-invalidated:
-	case <-time.After(time.Second):
-		t.Fatal("second invalidation did not finish")
-	}
+	waitForHandlerFlowEvent(t, done, "request did not finish after releasing Freshen")
+	waitForHandlerFlowEvent(t, invalidated, "second invalidation did not finish")
 	h.writes.Wait()
 
 	if got := rec.Body.String(); got != "after" {
@@ -1470,5 +1448,32 @@ func TestValidationRefetchesWhenInvalidatedDuringFreshen(t *testing.T) {
 	}
 	if got := upstreamCalls.Load(); got != 2 {
 		t.Fatalf("upstream calls = %d, want validation plus full refetch", got)
+	}
+}
+
+func waitForHandlerFlowEvent(t *testing.T, event <-chan struct{}, failure string) {
+	t.Helper()
+	select {
+	case <-event:
+	case <-time.After(time.Second):
+		t.Fatal(failure)
+	}
+}
+
+func waitForFreshenInvalidationBarrier(t *testing.T, c *cache, key string) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	for {
+		if at, ok := c.StaleAt(key); ok && at.Equal(invalidationBarrierTime) {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("second invalidation did not publish its barrier")
+		case <-poll.C:
+		}
 	}
 }
