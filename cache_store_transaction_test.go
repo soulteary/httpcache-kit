@@ -225,7 +225,7 @@ func TestFailedMultiKeyStoreCannotDeleteConcurrentNewerGeneration(t *testing.T) 
 				select {
 				case err := <-newer:
 					release.Do(func() { close(body.release) })
-					<-failed
+					select { case <-failed: }
 					t.Fatalf("newer writer passed incomplete transaction: %v", err)
 				case <-deadline:
 					t.Fatal("newer writer did not join the protected base key")
