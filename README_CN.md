@@ -22,7 +22,7 @@ RFC 7234 失效，以及可选的 Prometheus 指标。
 
 ## 要求
 
-- **Go 1.27.2+**（`go.mod` 声明 `go 1.27.2`）
+- **Go 1.27.3+**（`go.mod` 声明 `go 1.27.3`）
 - **只有导入 `prometheusmetrics` 时**才需要 `github.com/prometheus/client_golang`
 
 根包只依赖 `logger-kit/v3` 和 `vfs-kit`。Prometheus 和 `metrics-kit/v3` 只能经由
