@@ -177,7 +177,9 @@ func TestCacheParallelStoresReserveCapacity(t *testing.T) {
 			case <-started:
 			case <-time.After(time.Second):
 				close(release)
-				if err := <-first; err != nil { t.Logf("cleanup store failed: %v", err) }
+				if err := <-first; err != nil {
+					t.Logf("cleanup store failed: %v", err)
+				}
 				t.Fatal("first store did not reach streaming after admission")
 			}
 			secondErr := c.Store(generationBudgetResource(strings.Repeat("b", 1200), `"v2"`), "second")
@@ -352,7 +354,9 @@ func TestCacheReplacementReservesOnlyGrowth(t *testing.T) {
 		t.Fatalf("replacement incorrectly required its full size in addition to the old entry: %v", err)
 	case <-time.After(time.Second):
 		close(release)
-		if err := <-done; err != nil { t.Logf("cleanup store failed: %v", err) }
+		if err := <-done; err != nil {
+			t.Logf("cleanup store failed: %v", err)
+		}
 		t.Fatal("replacement did not reach its body stream")
 	}
 	// Its old entry remains charged until publication; the reserved growth
@@ -383,7 +387,9 @@ func TestCacheCleanupPreservesActiveReplacement(t *testing.T) {
 	case <-started:
 	case <-time.After(time.Second):
 		close(release)
-		if err := <-done; err != nil { t.Logf("cleanup store failed: %v", err) }
+		if err := <-done; err != nil {
+			t.Logf("cleanup store failed: %v", err)
+		}
 		t.Fatal("replacement did not reach its body stream")
 	}
 	c.lruMutex.Lock()
