@@ -4,9 +4,9 @@ go 1.27.4
 
 require (
 	github.com/prometheus/client_golang v1.25.0
-	github.com/soulteary/logger-kit/v3 v3.0.4
-	github.com/soulteary/metrics-kit/v3 v3.0.4
-	github.com/soulteary/vfs-kit v1.4.6
+	github.com/soulteary/logger-kit/v3 v3.0.5
+	github.com/soulteary/metrics-kit/v3 v3.0.5
+	github.com/soulteary/vfs-kit v1.4.7
 )
 
 require (
