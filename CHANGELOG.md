@@ -10,6 +10,12 @@ also changes the module path. The current one is
 
 ## [Unreleased]
 
+## [4.1.4] — 2026-11-13
+
+### Changed
+
+- Update `logger-kit/v3` to v3.0.6 and `metrics-kit/v3` to v3.0.6.
+
 ### Fixed
 
 - `Clock` no longer returns the same instant twice. On a platform whose wall

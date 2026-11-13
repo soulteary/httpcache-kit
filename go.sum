@@ -28,10 +28,10 @@ github.com/prometheus/procfs v0.23.0 h1:ad+S6FTkzwaMgacKLM5h6bNKExS+DMH0YiUwXItH
 github.com/prometheus/procfs v0.23.0/go.mod h1:3AVXO0FqLafyYFU/V/IQRZlC8Rgqz8Dm/x6pKLK+RIk=
 github.com/rs/zerolog v1.35.1 h1:m7xQeoiLIiV0BCEY4Hs+j2NG4Gp2o2KPKmhnnLiazKI=
 github.com/rs/zerolog v1.35.1/go.mod h1:EjML9kdfa/RMA7h/6z6pYmq1ykOuA8/mjWaEvGI+jcw=
-github.com/soulteary/logger-kit/v3 v3.0.5 h1:OT8UF/2QYkh2UCmRbDF6egUAUlBfhjeAlaFjcC+X3Ks=
-github.com/soulteary/logger-kit/v3 v3.0.5/go.mod h1:potaOcIrN4ihVzlUKRfkcFNbF2BF53TZe7wy81vsf8M=
-github.com/soulteary/metrics-kit/v3 v3.0.5 h1:/yAVIG+71FTqfj6OV5LCglu9dKDjbXagwcAYvGMJOcY=
-github.com/soulteary/metrics-kit/v3 v3.0.5/go.mod h1:0itHJumdqdMeIECRCOG3XpFQl8i49aexP/TQtKskii4=
+github.com/soulteary/logger-kit/v3 v3.0.6 h1:nI3721oSrvrivF6/6QQ5EPjWzuRcY1V8OUZ9ZdhcsaI=
+github.com/soulteary/logger-kit/v3 v3.0.6/go.mod h1:iO5A4eZndXWn/U5L3tzaPOKBrCM5gj1vsar7neibKuE=
+github.com/soulteary/metrics-kit/v3 v3.0.6 h1:jmEbyXhTekGxCno9gWI0MWOYTSlPfbylzPqroa6bFFw=
+github.com/soulteary/metrics-kit/v3 v3.0.6/go.mod h1:oWDCPG04+S+qwFzyS4JE0TLg/KmtKbYNi43ibF3gc5g=
 github.com/soulteary/vfs-kit v1.4.7 h1:If+rBlk1RduLVx3w2f5lh+KSdijKC/U+YrrtQnE6fks=
 github.com/soulteary/vfs-kit v1.4.7/go.mod h1:UARV0gPBN2Gb7zxY615rXlXAjqAnlQGNVbrxGHpyAbU=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
