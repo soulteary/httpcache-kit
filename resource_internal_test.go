@@ -225,7 +225,7 @@ func TestClockReadingsAreStrictlyIncreasing(t *testing.T) {
 		}
 		previous = current
 	}
-	if drift := previous.Sub(time.Now()); drift > time.Millisecond {
+	if drift := time.Until(previous); drift > time.Millisecond {
 		t.Fatalf("clock ran %v ahead of the wall clock", drift)
 	}
 }
@@ -236,7 +236,7 @@ func TestClockFollowsBackwardAdjustment(t *testing.T) {
 	saved := lastClockReading.Load()
 	defer lastClockReading.Store(saved)
 	lastClockReading.Store(time.Now().Add(time.Hour).UnixNano())
-	if ahead := Clock().Sub(time.Now()); ahead > time.Second {
+	if ahead := time.Until(Clock()); ahead > time.Second {
 		t.Fatalf("clock stayed %v ahead after a backward adjustment", ahead)
 	}
 }
