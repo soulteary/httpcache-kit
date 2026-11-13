@@ -70,8 +70,9 @@ func TestResource_Age_WithProxyDate(t *testing.T) {
 		"Proxy-Date": []string{past.Format(http.TimeFormat)},
 		"Age":        []string{"30"},
 	})
+	originalClock := Clock
 	Clock = func() time.Time { return past.Add(2 * time.Minute) }
-	defer func() { Clock = func() time.Time { return time.Now().UTC() } }()
+	defer func() { Clock = originalClock }()
 	d, err := r.Age()
 	if err != nil {
 		t.Fatal(err)
@@ -210,5 +211,32 @@ func TestResource_MaxAge_SMaxage_Shared_InvalidDuration(t *testing.T) {
 	_, err := r.MaxAge(true)
 	if err == nil {
 		t.Error("expected error for invalid s-maxage duration")
+	}
+}
+
+// TestClockReadingsAreStrictlyIncreasing covers platforms whose wall clock is
+// coarser than a nanosecond: consecutive readings must still be ordered.
+func TestClockReadingsAreStrictlyIncreasing(t *testing.T) {
+	previous := Clock()
+	for i := 0; i < 100000; i++ {
+		current := Clock()
+		if !current.After(previous) {
+			t.Fatalf("reading %d = %v is not after the previous reading %v", i, current, previous)
+		}
+		previous = current
+	}
+	if drift := previous.Sub(time.Now()); drift > time.Millisecond {
+		t.Fatalf("clock ran %v ahead of the wall clock", drift)
+	}
+}
+
+// TestClockFollowsBackwardAdjustment makes sure a stepped-back wall clock is
+// followed rather than held at the last reading.
+func TestClockFollowsBackwardAdjustment(t *testing.T) {
+	saved := lastClockReading.Load()
+	defer lastClockReading.Store(saved)
+	lastClockReading.Store(time.Now().Add(time.Hour).UnixNano())
+	if ahead := Clock().Sub(time.Now()); ahead > time.Second {
+		t.Fatalf("clock stayed %v ahead after a backward adjustment", ahead)
 	}
 }
