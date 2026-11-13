@@ -1,24 +1,24 @@
 {
   "schema_version": "1.0",
   "tests": {
-    "total": 456,
-    "passed": 455,
+    "total": 458,
+    "passed": 457,
     "failed": 0,
     "skipped": 1
   },
   "coverage": {
-    "covered_statements": 2404,
-    "total_statements": 2510,
-    "percentage": 95.78,
+    "covered_statements": 2409,
+    "total_statements": 2516,
+    "percentage": 95.75,
     "threshold": 0
   },
   "packages": [
     {
       "name": ".",
       "status": "pass",
-      "tests": 451,
+      "tests": 453,
       "failed": 0,
-      "coverage": 95.71
+      "coverage": 95.68
     },
     {
       "name": "prometheusmetrics",
