@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,8 +16,35 @@ const (
 	viaPseudonym   = "httpcache"
 )
 
-var Clock = func() time.Time {
-	return time.Now().UTC()
+// Clock returns the current time in UTC. It is a variable so that tests can
+// replace it.
+//
+// The default implementation never returns the same instant twice. Cache
+// generations are ordered by comparing these readings, and the wall clock is
+// coarser than a nanosecond on some platforms (a microsecond on macOS), where
+// an invalidation and the publication that follows it could otherwise be
+// stamped with the same instant and the new entry be judged no newer than the
+// invalidation.
+var Clock = strictlyIncreasingNow
+
+// clockTieWindow bounds how far behind the previous reading the wall clock may
+// be while it is still treated as a coarse-clock tie. A larger backward step is
+// a clock adjustment and is followed.
+const clockTieWindow = time.Second
+
+var lastClockReading atomic.Int64
+
+func strictlyIncreasingNow() time.Time {
+	for {
+		now := time.Now().UnixNano()
+		last := lastClockReading.Load()
+		if now <= last && last-now < int64(clockTieWindow) {
+			now = last + 1
+		}
+		if lastClockReading.CompareAndSwap(last, now) {
+			return time.Unix(0, now).UTC()
+		}
+	}
 }
 
 type ReadSeekCloser interface {

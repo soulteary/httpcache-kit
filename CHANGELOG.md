@@ -10,6 +10,21 @@ also changes the module path. The current one is
 
 ## [Unreleased]
 
+## [4.1.4] — 2026-11-13
+
+### Changed
+
+- Update `logger-kit/v3` to v3.0.6 and `metrics-kit/v3` to v3.0.6.
+
+### Fixed
+
+- `Clock` no longer returns the same instant twice. On a platform whose wall
+  clock is coarser than a nanosecond (a microsecond on macOS), a handler in
+  front of a `Cache` that does not report invalidation times could stamp an
+  invalidation and the publication that followed it with the same instant,
+  judge the new entry no newer than the invalidation and send the next
+  request to the origin again. Stale content was not served.
+
 ## [4.0.2] — 2026-10-13
 
 ### Changed
