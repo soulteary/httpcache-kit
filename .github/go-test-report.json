@@ -7,9 +7,9 @@
     "skipped": 1
   },
   "coverage": {
-    "covered_statements": 2409,
+    "covered_statements": 2410,
     "total_statements": 2516,
-    "percentage": 95.75,
+    "percentage": 95.79,
     "threshold": 0
   },
   "packages": [
@@ -18,7 +18,7 @@
       "status": "pass",
       "tests": 453,
       "failed": 0,
-      "coverage": 95.68
+      "coverage": 95.72
     },
     {
       "name": "prometheusmetrics",

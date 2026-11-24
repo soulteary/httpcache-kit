@@ -8,12 +8,12 @@
 | Passed | 457 |
 | Failed | 0 |
 | Skipped | 1 |
-| Coverage | 95.75% |
+| Coverage | 95.79% |
 | Threshold | 0.00% |
 
 ### Packages
 
 | Package | Status | Tests | Failed | Coverage |
 | --- | --- | --- | --- | --- |
-| . | pass | 453 | 0 | 95.68% |
+| . | pass | 453 | 0 | 95.72% |
 | prometheusmetrics | pass | 5 | 0 | 100.00% |
