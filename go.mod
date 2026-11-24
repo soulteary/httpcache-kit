@@ -4,8 +4,8 @@ go 1.27.4
 
 require (
 	github.com/prometheus/client_golang v1.25.0
-	github.com/soulteary/logger-kit/v3 v3.0.6
-	github.com/soulteary/metrics-kit/v3 v3.0.6
+	github.com/soulteary/logger-kit/v3 v3.0.7
+	github.com/soulteary/metrics-kit/v3 v3.0.7
 	github.com/soulteary/vfs-kit v1.4.7
 )
 
@@ -18,9 +18,9 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pandatix/go-abnf v0.5.5 // indirect
 	github.com/prometheus/client_model v0.6.3 // indirect
-	github.com/prometheus/common v0.73.1 // indirect
+	github.com/prometheus/common v0.74.0 // indirect
 	github.com/prometheus/procfs v0.23.0 // indirect
 	github.com/rs/zerolog v1.35.1 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )

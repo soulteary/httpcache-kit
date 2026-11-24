@@ -10,6 +10,20 @@ also changes the module path. The current one is
 
 ## [Unreleased]
 
+## [4.1.5] — 2026-11-24
+
+### Changed
+
+- Update `logger-kit/v3` from v3.0.6 to v3.0.7 and `metrics-kit/v3` from
+  v3.0.6 to v3.0.7.
+- Update the indirect requirements `prometheus/common` from v0.73.1 to
+  v0.74.0 and `golang.org/x/sys` from v0.49.0 to v0.50.0.
+- Refresh transitive checksums for `klauspost/compress` v1.20.5 and
+  `go.yaml.in/yaml/v2` v2.4.5.
+
+The module path and the public API are unchanged. The Go requirement remains
+1.27.4.
+
 ## [4.1.4] — 2026-11-13
 
 ### Changed
